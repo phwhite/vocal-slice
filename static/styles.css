@@ -1646,6 +1646,18 @@ select:focus {
     border-color: var(--mauve);
 }
 
+/* Bulk delete: outlined in red at rest so it reads as destructive without shouting, filled on hover. */
+.slices-toolbar-btn-danger:not(:disabled) {
+    color: var(--red);
+    border-color: var(--red);
+}
+
+.slices-toolbar-btn-danger:hover:not(:disabled) {
+    background: var(--red);
+    border-color: var(--red);
+    color: var(--crust);
+}
+
 .slices-toolbar-btn:disabled {
     color: var(--overlay0);
     cursor: not-allowed;

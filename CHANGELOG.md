@@ -25,6 +25,7 @@ the commit that renamed a heading would itself bump the count and make that head
 ## Unreleased
 
 - The "open audio file" and "export slices" pickers now each remember their own folder. Choosing somewhere to export your clips used to move where the next file picker opened, so you'd land in your exports folder when you went to open the next recording.
+- You can now delete several slices at once: tick them on the Slices tab and press **Delete selected**. One confirmation covers the lot, instead of a prompt per slice.
 - **Vocal Slice is now free and open source.** There's no trial and no licence key any more — every feature is unlocked for everyone, and the full source is on GitHub under the GPL-3.0. If you bought a licence, thank you: you don't need to do anything, and nothing you had stops working.
 - The License page has gone from Settings, along with the trial countdown in the tab bar. Vocal Slice also tidies away the licence and trial records it used to keep on your computer.
 - Settings → About now shows the open-source licence notice and a link to the source code.

@@ -3318,6 +3318,7 @@
             // Slices-tab selection toolbar
             if (e.target.closest('#slices-select-all-btn')) toggleSelectAllSlices();
             if (e.target.closest('#export-slices-btn')) exportSelectedSlices();
+            if (e.target.closest('#delete-slices-btn')) deleteSelectedSlices();
             // Inline slice-editor buttons
             if (e.target.closest('#edit-cancel-btn')) closeSliceEditor();
             if (e.target.closest('#edit-update-btn')) saveEditedSlice(false).then(() => closeSliceEditor());
@@ -3428,12 +3429,14 @@
             const count = selectedSlices.size;
             const countEl = document.getElementById('slices-selected-count');
             const exportBtn = document.getElementById('export-slices-btn');
+            const deleteBtn = document.getElementById('delete-slices-btn');
             const selectAllBtn = document.getElementById('slices-select-all-btn');
             // Once anything is ticked, every card shows its checkbox instead of its #N badge —
             // otherwise you'd have to hover each one to see what's still selected.
             document.getElementById('slices-list')?.classList.toggle('slices-selecting', count > 0);
             if (countEl) countEl.textContent = count ? `${count} selected` : '';
             if (exportBtn) exportBtn.disabled = count === 0;
+            if (deleteBtn) deleteBtn.disabled = count === 0;
             if (selectAllBtn) selectAllBtn.textContent = count === slices.length && count > 0 ? 'Clear' : 'Select all';
         }
 
@@ -3461,6 +3464,39 @@
                 addLog(`❌ Export failed: ${error.message}`);
                 alert(`Export failed.\n\n${error.message}`);
             }
+        }
+
+        // Bulk counterpart of deleteSlice: one confirmation, then every ticked slice goes.
+        function deleteSelectedSlices() {
+            const indices = selectedIndices();
+            const n = indices.length;
+            if (n === 0) return;
+            const message = n === 1
+                ? `Delete slice "${slices[indices[0]].text}"?`
+                : `Delete ${n} selected slices?\n\nThis cannot be undone.`;
+            if (!confirm(message)) return;
+
+            // Indices shift as the array shrinks, so an open editor's index would go stale — close it.
+            if (previewState.editingSliceIndex != null) closeSliceEditor();
+
+            // Splice from the highest index down so the lower ones stay valid as we go.
+            for (const index of [...indices].reverse()) {
+                const slice = slices[index];
+                if (!slice) continue;
+                if (slice.url) URL.revokeObjectURL(slice.url);
+                if (slice.filePath && window.electronAPI) {
+                    window.electronAPI.deleteSliceFile(slice.filePath).catch(err => {
+                        console.error('Failed to delete slice file:', err);
+                    });
+                }
+                slices.splice(index, 1);
+            }
+            selectedSlices.clear();
+            gcTranscriptionCache();
+            updateSlicesList();
+            saveSessionState();
+            addLog(`🗑️ Deleted ${n} slice(s)`);
+            showToast(`Deleted ${n} slice${n === 1 ? '' : 's'}`, { icon: 'ph ph-trash' });
         }
 
         // Shared audio extraction + save logic used by createSlice and updateSlice
