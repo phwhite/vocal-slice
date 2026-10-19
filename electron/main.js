@@ -17,6 +17,26 @@ if (!fs.existsSync(slicesDir)) {
     fs.mkdirSync(slicesDir, { recursive: true });
 }
 
+// Last-used folders for the two file pickers, kept separately. Chromium remembers a single "last
+// directory" for every dialog it shows, so picking an export folder used to move where the next
+// "open audio" picker started. Local-only and best-effort: a missing or unreadable file just means
+// the dialogs fall back to their defaults.
+const dialogDirsPath = path.join(userDataPath, 'dialog-dirs.json');
+function readDialogDirs() {
+  try { return JSON.parse(fs.readFileSync(dialogDirsPath, 'utf8')) || {}; } catch { return {}; }
+}
+function rememberedDir(key) {
+  const dir = readDialogDirs()[key];
+  return typeof dir === 'string' && fs.existsSync(dir) ? { defaultPath: dir } : {};
+}
+function rememberDir(key, dir) {
+  try {
+    fs.writeFileSync(dialogDirsPath, JSON.stringify({ ...readDialogDirs(), [key]: dir }));
+  } catch (error) {
+    console.error('Failed to remember folder:', error);
+  }
+}
+
 // Hot reload in development mode
 const isDev = process.argv.includes('--dev') || !app.isPackaged;
 if (isDev) {
@@ -159,6 +179,7 @@ function createWindow() {
 // IPC Handlers for safe file operations
 ipcMain.handle('open-file-dialog', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
+    ...rememberedDir('open'),
     properties: ['openFile'],
     // Only formats Chromium can actually decode. Decoding is a bare decodeAudioData (app.js), so
     // this list has to track the media stack, not our wishes: .wma and .aiff were offered here and
@@ -177,7 +198,8 @@ ipcMain.handle('open-file-dialog', async () => {
   
   const filePath = result.filePaths[0];
   const stats = fs.statSync(filePath);
-  
+  rememberDir('open', path.dirname(filePath));
+
   return {
     path: filePath,
     name: path.basename(filePath),
@@ -320,6 +342,7 @@ ipcMain.handle('export-slices', async (event, items) => {
   if (resolved.length === 0) return { dir: null, written: 0, skipped };
 
   const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+    ...rememberedDir('export'),
     title: 'Export slices to…',
     buttonLabel: 'Export here',
     properties: ['openDirectory', 'createDirectory']
@@ -327,6 +350,7 @@ ipcMain.handle('export-slices', async (event, items) => {
   if (canceled || !filePaths || filePaths.length === 0) return null;
 
   const dir = filePaths[0];
+  rememberDir('export', dir);
   let written = 0;
   for (const { src, name } of resolved) {
     try {
