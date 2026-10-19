@@ -136,6 +136,12 @@
         function activeAudioBuffer()    { return inModal() ? editState.audioBuffer    : currentAudioBuffer; }
         function activeTranscription()  { return inModal() ? editState.transcription  : currentTranscription; }
         function activeFile()           { return inModal() ? editState.file           : currentFile; }
+        // True when the waveform the space bar would drive is actually on screen: the Transcription
+        // tab, or the inline slice editor on the Slices tab. Elsewhere (Settings) space stays inert.
+        function previewPaneVisible() {
+            if (inModal()) return true;
+            return !!document.getElementById('transcription-tab')?.classList.contains('active');
+        }
 
         function getWaveformEls() {
             const p = waveformContext === 'modal' ? 'edit-' : '';
@@ -2105,6 +2111,26 @@
                     return;
                 }
                 
+                // Space toggles play/pause of the current selection. Without this, space went to
+                // whichever button was last clicked — usually Create Slice, so a tap on the bar made
+                // another clip. The transcript textarea is read-only, so a space there means
+                // play/pause too; only genuinely editable fields (time boxes, search, slice names,
+                // dropdowns) keep their space.
+                if (e.key === ' ' || e.code === 'Space') {
+                    const el = document.activeElement;
+                    const editable = el && (
+                        (el.tagName === 'INPUT' && !['button', 'checkbox', 'radio', 'range'].includes(el.type)) ||
+                        el.tagName === 'SELECT' ||
+                        (el.tagName === 'TEXTAREA' && !el.readOnly) ||
+                        el.isContentEditable
+                    );
+                    if (!editable && activeOriginalBuffer() && previewPaneVisible()) {
+                        e.preventDefault();
+                        togglePreviewPlayback();
+                    }
+                    return;
+                }
+
                 // Escape key clears search
                 if (e.key === 'Escape' && searchActive) {
                     const searchBox = document.getElementById('search-box');
