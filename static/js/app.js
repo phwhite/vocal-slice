@@ -3063,6 +3063,18 @@
             };
         }
 
+        // Zoom button: reframe the waveform around whatever the handles currently bracket, with the
+        // same padding a fresh text selection gets. Highlighting words zooms to those words; after
+        // narrowing with the handles, this re-zooms to the narrower range. Playback is untouched —
+        // only the window moves, and the handles/playhead are repositioned inside it.
+        window.zoomToSelection = function() {
+            if (!activeOriginalBuffer()) return;
+            const { windowStart, windowEnd } = computeWindow(previewState.startTime, previewState.endTime);
+            previewState.windowStart = windowStart;
+            previewState.windowEnd = windowEnd;
+            drawWaveform().then(() => updateHandlePositions());
+        };
+
         function enterOverviewMode() {
             _currentSelectionMatch = null;
             selectionAudioMatches = [];
@@ -3328,6 +3340,7 @@
             if (e.target.closest('#edit-preview-stop-btn')) stopPreview();
             if (e.target.closest('#edit-preview-pause-btn')) pausePreview();
             if (e.target.closest('#edit-preview-loop-btn')) toggleLoop();
+            if (e.target.closest('#edit-preview-zoom-btn')) zoomToSelection();
         });
 
         document.addEventListener('change', (e) => {

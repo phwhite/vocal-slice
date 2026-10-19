@@ -129,6 +129,9 @@
                             <button class="transport-btn" id="preview-loop-btn" onclick="toggleLoop()" title="Loop playback">
                                 <i class="ph ph-repeat"></i>
                             </button>
+                            <button class="transport-btn" id="preview-zoom-btn" onclick="zoomToSelection()" title="Zoom waveform to selection">
+                                <i class="ph ph-magnifying-glass-plus"></i>
+                            </button>
                             <div class="transport-divider"></div>
                             <select id="playback-speed" class="transport-select" onchange="updatePlaybackSpeed()" title="Playback speed">
                                 <option value="0.5">0.5x</option>
@@ -671,6 +674,9 @@
                 </button>
                 <button class="transport-btn" id="edit-preview-loop-btn" title="Loop playback">
                     <i class="ph ph-repeat"></i>
+                </button>
+                <button class="transport-btn" id="edit-preview-zoom-btn" title="Zoom waveform to selection">
+                    <i class="ph ph-magnifying-glass-plus"></i>
                 </button>
                 <div class="transport-divider"></div>
                 <select id="edit-playback-speed" class="transport-select" title="Playback speed">
