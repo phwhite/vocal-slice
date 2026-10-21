@@ -45,9 +45,9 @@
             <div id="transcription-tab" class="tab-content active">
                 <!-- File / model controls (live in the Transcription tab) -->
                 <div class="top-controls">
-                    <input type="file" id="audio-file" accept="audio/*" style="display: none;" onchange="handleFileSelected()">
+                    <input type="file" id="audio-file" accept="audio/*,video/mp4,video/quicktime,video/x-m4v" style="display: none;" onchange="handleFileSelected()">
 
-                    <button type="button" class="file-info" id="file-info" onclick="handleFileSelected()" title="Choose or change audio file">
+                    <button type="button" class="file-info" id="file-info" onclick="handleFileSelected()" title="Choose or change audio or video file">
                         <i class="ph ph-folder-open"></i>
                         <span>Select audio file</span>
                     </button>

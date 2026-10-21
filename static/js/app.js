@@ -406,7 +406,7 @@
                         restoreMarkers(sessionState);
 
                         const fileSizeMB = (sessionState.fileSize / (1024 * 1024)).toFixed(1);
-                        document.getElementById('file-info').innerHTML = `<i class="ph ph-file-audio"></i><span>${sessionState.fileName} (${fileSizeMB} MB)</span>`;
+                        document.getElementById('file-info').innerHTML = `<i class="${fileIconClass(sessionState.fileName)}"></i><span>${sessionState.fileName} (${fileSizeMB} MB)</span>`;
                         document.getElementById('transcribe-btn').disabled = false;
 
                         // Show the waveform area with a loading spinner while the audio decodes.
@@ -1286,7 +1286,7 @@
                     };
                     
                     const fileSizeMB = (currentFile.size / (1024 * 1024)).toFixed(1);
-                    document.getElementById('file-info').innerHTML = `<i class="ph ph-file-audio"></i><span>${currentFile.name} (${fileSizeMB} MB)</span>`;
+                    document.getElementById('file-info').innerHTML = `<i class="${fileIconClass(currentFile.name)}"></i><span>${currentFile.name} (${fileSizeMB} MB)</span>`;
                     document.getElementById('transcribe-btn').disabled = false;
                     addLog(`File selected: ${currentFile.name} (${fileSizeMB} MB)`);
                     addLog(`📁 Path: ${currentFile.path}`);
@@ -1319,7 +1319,7 @@
                     clearMarkers(); // markers belong to the previous file
                     currentFile = input.files[0];
                     const fileSizeMB = (currentFile.size / (1024 * 1024)).toFixed(1);
-                    fileInfoDiv.innerHTML = `<i class="ph ph-file-audio"></i><span>${currentFile.name} (${fileSizeMB} MB)</span>`;
+                    fileInfoDiv.innerHTML = `<i class="${fileIconClass(currentFile.name)}"></i><span>${currentFile.name} (${fileSizeMB} MB)</span>`;
                     transcribeBtn.disabled = false;
                     addLog(`File selected: ${currentFile.name} (${fileSizeMB} MB)`);
                     addLog('⚠️ Browser mode - session restore not available');
@@ -1387,6 +1387,14 @@
             }
         };
 
+        // Video containers are opened for their audio track only (Chromium's decoder demuxes them and
+        // ignores the picture). The icon is the one place the app tells a video from an audio file.
+        const VIDEO_EXTENSIONS = ['mp4', 'mov', 'm4v'];
+        function fileIconClass(name) {
+            const ext = String(name || '').split('.').pop().toLowerCase();
+            return VIDEO_EXTENSIONS.includes(ext) ? 'ph ph-file-video' : 'ph ph-file-audio';
+        }
+
         // Load and process audio file with progress feedback.
         //
         // The two ways this fails are told apart and tagged, because callers otherwise have to guess
@@ -1422,7 +1430,7 @@
                 // Keep this list in step with the picker's filters in electron/main.js — decoding is
                 // whatever Chromium supports, so both places describe the same set.
                 const err = new Error(`Couldn't open “${label}”. It isn't a format Vocal Slice can read — ` +
-                    `try WAV, MP3, FLAC, M4A, AAC or OGG.`);
+                    `try WAV, MP3, FLAC, M4A, AAC or OGG, or an MP4 or MOV video.`);
                 err.code = 'audio-undecodable';
                 err.cause = cause;
                 throw err;
@@ -5506,7 +5514,7 @@
                     src.className = 'slice-source';
                     src.title = slice.sourceAudioPath;
                     const srcIcon = document.createElement('i');
-                    srcIcon.className = 'ph ph-file-audio';
+                    srcIcon.className = fileIconClass(slice.sourceAudioPath);
                     src.appendChild(srcIcon);
                     src.appendChild(document.createTextNode(' ' + _basename(slice.sourceAudioPath)));
                     headerLeft.appendChild(src);

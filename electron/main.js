@@ -187,7 +187,12 @@ ipcMain.handle('open-file-dialog', async () => {
     // own, the user got an alert claiming *transcription* had failed, for a format we suggested.
     // loadAudioFile in static/js/app.js names this same set when a file won't decode — change both.
     filters: [
+      // Video containers are accepted for their audio track: the same decoder demuxes MP4/MOV and
+      // drops the picture. The whole file is still read into memory first, so multi-gigabyte
+      // recordings are a known limit — pulling the audio track out in main is the follow-up.
+      { name: 'Audio & Video Files', extensions: ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac', 'mp4', 'mov', 'm4v'] },
       { name: 'Audio Files', extensions: ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac'] },
+      { name: 'Video Files', extensions: ['mp4', 'mov', 'm4v'] },
       { name: 'All Files', extensions: ['*'] }
     ]
   });

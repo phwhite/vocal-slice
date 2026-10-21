@@ -24,6 +24,7 @@ the commit that renamed a heading would itself bump the count and make that head
 
 ## Unreleased
 
+- You can now open MP4 and MOV videos. Vocal Slice uses the sound track and ignores the picture, so a phone recording, a screen capture or a video call export can be transcribed and sliced like any audio file. The file picker lists them alongside audio, and a video shows a film icon in the file bar.
 - Press **M** while listening to drop a numbered marker at the playhead (or use the new bookmark button next to zoom). Markers show as blue lines on the waveform and blue tags in the transcript, and are listed in a pane beside the transcript where you can click one to jump there or double-click its name to rename it. Right-click any marker to rename it, delete it, or turn it straight into a selection that runs to the next marker. **[** and **]** jump between markers, and markers are saved with your session.
 - The transcript now reads like prose. Each sentence starts on its own line, and a long pause (or a long run of sentences) starts a new paragraph, so you can find your place instead of facing one block of words. Older saved sessions get the same layout.
 - A faint time stamp appears beside the first line of each paragraph, and small sentence numbers sit beside each sentence. They live in a margin, so selecting text never picks them up.
