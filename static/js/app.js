@@ -99,6 +99,11 @@
         let currentAudioBuffer = null; // Float32Array for Whisper transcription
         let originalAudioBuffer = null; // Full AudioBuffer for waveform display and slicing
         let currentTranscription = null;
+        // Transcript box: display layout derived from the chunks (see buildTranscriptLayout) and the
+        // highlight currently drawn in the overlay ({start, end, cls} in textarea char offsets).
+        let transcriptLayout = null;
+        let overlayHighlight = null;
+        let overlaySig = '';
         // The first-run demo is a view-only preview reconstructed from a bundled clip + baked
         // transcription. While it's showing, nothing is persisted (see saveSessionState), so it never
         // pollutes a returning user's session or creates real slices.
@@ -115,6 +120,11 @@
         // Deliberately transient (never persisted) and cleared by deleteSlice — that splices the
         // array, which would shift every later index and leave these pointing at the wrong slices.
         const selectedSlices = new Set();
+        // Markers on the Transcription tab's file: { id, time (s), n (display number), name }.
+        // Numbers come from nextMarkerNumber in creation order and never shift on delete. Kept in
+        // creation order here; sortedMarkers() gives time order for display and navigation.
+        let markers = [];
+        let nextMarkerNumber = 1;
         let sliceDecodeContext = null;
         let webgpuSupported = false;
         
@@ -191,6 +201,9 @@
                         sourceAudioPath: slice.sourceAudioPath,
                         chunks: slice.chunks || []
                     })),
+                    // Markers belong to audioFilePath; restoreSession only brings them back with it.
+                    markers: markers.map(m => ({ id: m.id, time: m.time, n: m.n, name: m.name || '' })),
+                    nextMarkerNumber,
                     timestamp: Date.now()
                 };
                 
@@ -311,12 +324,13 @@
                 _sourceBytesCache = null;
                 slices = [];
                 selectedSlices.clear();
+                clearMarkers();
 
                 // Reset UI
                 document.getElementById('file-info').innerHTML = '<i class="ph ph-folder-open"></i><span>Select audio file</span>';
                 document.getElementById('transcribe-btn').disabled = true;
                 document.getElementById('create-slice-btn').disabled = true;
-                document.getElementById('transcription-text').value = '';
+                setTranscriptText(null, '');
                 document.getElementById('transcription-content').style.display = 'none';
                 document.getElementById('transcription-empty').style.display = 'block';
                 document.getElementById('slices-list').innerHTML = '';
@@ -365,7 +379,7 @@
                         cacheTranscription(sessionState.audioFilePath, currentTranscription);
                     }
                     const textToDisplay = sessionState.transcriptionText || sessionState.transcription?.text || '';
-                    document.getElementById('transcription-text').value = textToDisplay;
+                    setTranscriptText(sessionState.transcription, textToDisplay);
                     document.getElementById('transcription-content').style.display = 'flex';
                     document.getElementById('transcription-empty').style.display = 'none';
                     setupSearchHandlers();
@@ -384,6 +398,9 @@
                             size: sessionState.fileSize,
                             path: sessionState.audioFilePath
                         };
+                        // Same file is back: so are its markers. Restored before the audio decode so
+                        // a save fired meanwhile can't overwrite them with an empty list.
+                        restoreMarkers(sessionState);
 
                         const fileSizeMB = (sessionState.fileSize / (1024 * 1024)).toFixed(1);
                         document.getElementById('file-info').innerHTML = `<i class="ph ph-file-audio"></i><span>${sessionState.fileName} (${fileSizeMB} MB)</span>`;
@@ -554,6 +571,7 @@
                 const loaded = await loadAudioFile(demoFile);
 
                 demoMode = true;
+                clearMarkers();
                 currentFile = demoFile;
                 originalAudioBuffer = loaded.audioBuffer;
                 currentAudioBuffer = loaded.audioData;
@@ -561,8 +579,7 @@
                 // demo.json ships raw Whisper timestamps; align them to the clip's onsets on load.
                 alignChunksToOnsets(currentTranscription.chunks || currentTranscription.allTokens, currentAudioBuffer, 16000);
 
-                document.getElementById('transcription-text').value =
-                    transcription.text || transcription.continuousText || '';
+                setTranscriptText(transcription, transcription.text || transcription.continuousText || '');
                 document.getElementById('file-info').innerHTML =
                     `<i class="ph ph-sparkle"></i><span>${DEMO_LABEL}</span>`;
                 document.getElementById('transcribe-btn').disabled = true; // demo is already transcribed
@@ -586,11 +603,12 @@
         // Leave the demo and return to the clean empty state, touching no persisted data.
         function exitDemo() {
             demoMode = false;
+            clearMarkers();
             currentFile = null;
             currentAudioBuffer = null;
             originalAudioBuffer = null;
             currentTranscription = null;
-            document.getElementById('transcription-text').value = '';
+            setTranscriptText(null, '');
             document.getElementById('transcription-content').style.display = 'none';
             document.getElementById('transcription-waveform-section').style.display = 'none';
             document.getElementById('transcription-empty').style.display = 'block';
@@ -1253,6 +1271,8 @@
                     // A real file was chosen: only now end the demo preview (if it was showing).
                     if (demoMode) exitDemo();
 
+                    clearMarkers(); // markers belong to the previous file
+
                     // Create file object with path
                     currentFile = {
                         name: fileInfo.name,
@@ -1291,6 +1311,7 @@
                 if (input.files && input.files[0]) {
                     // A real file was chosen: only now end the demo preview (if it was showing).
                     if (demoMode) exitDemo();
+                    clearMarkers(); // markers belong to the previous file
                     currentFile = input.files[0];
                     const fileSizeMB = (currentFile.size / (1024 * 1024)).toFixed(1);
                     fileInfoDiv.innerHTML = `<i class="ph ph-file-audio"></i><span>${currentFile.name} (${fileSizeMB} MB)</span>`;
@@ -1781,7 +1802,7 @@
                     }
                 }
                 
-                document.getElementById('transcription-text').value = transcriptText;
+                setTranscriptText(currentTranscription, transcriptText);
 
                 // Save session state (persists the current transcription for next session;
                 // the per-file cache is populated when a slice references this file)
@@ -1840,6 +1861,224 @@
         }
         
         // Search Functions
+        // ============================================
+        // TRANSCRIPT LAYOUT + OVERLAY
+        // ============================================
+        // The textarea shows the transcript as prose: one sentence per line, a blank line between
+        // paragraphs. The text is derived deterministically from the chunks, so it is identical for a
+        // fresh transcription, a restored session and a cached one. Only whitespace between words is
+        // added, so every char-offset consumer (search, selection <-> time) still lines up.
+        // The overlay (#highlight-layer) draws ALL the visible glyphs (the textarea text is
+        // transparent): normal colour inside the waveform's zoom window, muted outside it, plus the
+        // selection highlight and the gutter labels (paragraph time stamps, sentence numbers).
+        const PARA_GAP_SECONDS = 1.0;     // silence between words that starts a new paragraph
+        const PARA_LONG_CHARS = 400;      // a paragraph this long breaks at the next sentence end
+        const NOT_A_SENTENCE_END = /^(?:mr|mrs|ms|dr|prof|sr|jr|st|vs|inc|ltd|no|[a-z]|(?:[a-z]\.){2,})\.?$/i;
+
+        function isSentenceEnd(word) {
+            if (!/[.?!]["'”’)\]]*$/.test(word)) return false;
+            if (/(?:\.\.\.|…)["'”’)\]]*$/.test(word)) return false;   // ellipsis: mid-thought
+            if (/[?!]["'”’)\]]*$/.test(word)) return true;
+            const bare = word.replace(/^["'“‘(\[]+|["'”’)\]]+$/g, '');
+            return !NOT_A_SENTENCE_END.test(bare);                                    // "Dr." / "U.S." / "J."
+        }
+
+        function formatClock(sec) {
+            sec = Math.max(0, Math.floor(sec || 0));
+            const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), r = sec % 60;
+            return h ? `${h}:${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`
+                     : `${m}:${String(r).padStart(2, '0')}`;
+        }
+
+        function buildTranscriptLayout(chunks) {
+            let text = '';
+            const words = [];    // { s, e, c }  char range in `text` + the chunk (timestamps read live)
+            const labels = [];   // { pos, ts, n }  one per sentence; ts only on a paragraph's first line
+            let sentenceNo = 0, paraChars = 0, prevEnd = 0, prevWasSentenceEnd = false;
+            for (const c of chunks) {
+                const w = (c.text || '').trim();
+                if (!w) continue;
+                const t0 = c.timestamp ? c.timestamp[0] : null;
+                const t1 = c.timestamp ? c.timestamp[1] : null;
+                let sep = '', newPara = false, newSentence = false;
+                if (words.length === 0) {
+                    newPara = newSentence = true;
+                } else {
+                    const gap = (t0 != null && prevEnd != null) ? t0 - prevEnd : 0;
+                    if (gap > PARA_GAP_SECONDS || (prevWasSentenceEnd && paraChars > PARA_LONG_CHARS)) newPara = newSentence = true;
+                    else if (prevWasSentenceEnd) newSentence = true;
+                    sep = newPara ? '\n\n' : newSentence ? '\n' : ' ';
+                }
+                text += sep;
+                if (newPara) paraChars = 0;
+                if (newSentence) labels.push({ pos: text.length, ts: newPara ? formatClock(t0) : '', n: ++sentenceNo });
+                words.push({ s: text.length, e: text.length + w.length, c });
+                text += w;
+                paraChars += w.length + 1;
+                prevEnd = t1;
+                prevWasSentenceEnd = isSentenceEnd(w);
+            }
+            return { text, words, labels, chunks };
+        }
+
+        // Put the transcript in the textarea (formatted from its chunks when it has them) and redraw.
+        function setTranscriptText(tr, fallbackText) {
+            const ta = document.getElementById('transcription-text');
+            if (!ta) return;
+            const chunks = tr && (tr.chunks || tr.allTokens);
+            transcriptLayout = chunks && chunks.length ? buildTranscriptLayout(chunks) : null;
+            ta.value = transcriptLayout && transcriptLayout.words.length ? transcriptLayout.text : (fallbackText || '');
+            overlayHighlight = null;
+            renderOverlay(true);
+        }
+
+        function escapeOverlay(str) {
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function setOverlayHighlight(h) {
+            overlayHighlight = h;
+            renderOverlay();
+        }
+
+        // Rebuild the overlay in one pass. Skipped when nothing it depends on changed.
+        function renderOverlay(force = false) {
+            const hl = document.getElementById('highlight-layer');
+            const ta = document.getElementById('transcription-text');
+            if (!hl || !ta) return;
+            const text = ta.value;
+            const L = transcriptLayout && transcriptLayout.text === text ? transcriptLayout : null;
+
+            // Dim words outside the waveform's zoom window (never when the whole file is in view).
+            const ws = previewState.windowStart, we = previewState.windowEnd;
+            const dur = originalAudioBuffer ? originalAudioBuffer.duration : 0;
+            const dimOn = !!L && waveformContext === 'transcription' && dur > 0 && we > ws &&
+                (ws > 0.001 || we < dur - 0.001);
+            const hasHl = !!overlayHighlight && overlayHighlight.end > overlayHighlight.start;
+            // Marker tags: each sits in front of the first word starting at/after its time.
+            const mks = L ? markerTagPositions(L) : [];
+            const sig = [text.length, L ? 1 : 0, dimOn ? ws.toFixed(3) + '-' + we.toFixed(3) : '-',
+                hasHl ? overlayHighlight.start + ':' + overlayHighlight.end + ':' + overlayHighlight.cls : '-',
+                mks.map(k => k.m.id + '@' + k.pos + ':' + k.m.name).join(',')].join('|');
+            if (!force && sig === overlaySig) return;
+            overlaySig = sig;
+
+            // The overlay mirrors the textarea's font so the glyphs land on the same pixels.
+            const cs = window.getComputedStyle(ta);
+            hl.style.fontFamily = cs.fontFamily;
+            hl.style.fontSize = cs.fontSize;
+            hl.style.lineHeight = cs.lineHeight;
+            hl.style.letterSpacing = cs.letterSpacing;
+            hl.style.wordSpacing = cs.wordSpacing;
+            hl.style.setProperty('--tx-lh', cs.lineHeight);
+
+            // Segments of constant dim state covering the whole text.
+            const segs = [];
+            if (dimOn) {
+                const inWin = (w) => {
+                    const t = w.c.timestamp;
+                    return !t || (t[1] > ws && t[0] < we);
+                };
+                const ws_ = L.words;
+                let runStart = 0, runDim = !inWin(ws_[0]);
+                for (let i = 1; i < ws_.length; i++) {
+                    const d = !inWin(ws_[i]);
+                    if (d !== runDim) { segs.push({ s: runStart, e: ws_[i].s, dim: runDim }); runStart = ws_[i].s; runDim = d; }
+                }
+                segs.push({ s: runStart, e: text.length, dim: runDim });
+            } else {
+                segs.push({ s: 0, e: text.length, dim: false });
+            }
+
+            const labels = L ? L.labels : [];
+            const hs = hasHl ? overlayHighlight.start : -1;
+            const he = hasHl ? overlayHighlight.end : -1;
+            let out = '', li = 0, mi = 0, inHl = false;
+            for (const seg of segs) {
+                let s = seg.s;
+                while (s < seg.e) {
+                    if (inHl && s >= he) { out += '</span>'; inHl = false; }
+                    while (li < labels.length && labels[li].pos <= s) {
+                        const lb = labels[li++];
+                        if (lb.pos === s) {
+                            if (lb.ts) out += '<span class="tx-ts">' + lb.ts + '</span>';
+                            out += '<span class="tx-sn">' + lb.n + '</span>';
+                        }
+                    }
+                    // Zero-width, absolutely positioned (like the gutter labels), so the overlay's
+                    // text stays pixel-aligned with the textarea underneath. Always at a word start,
+                    // i.e. just after a space/newline, so it adds no new line-break opportunity.
+                    let stack = 0;
+                    while (mi < mks.length && mks[mi].pos <= s) {
+                        const k = mks[mi++];
+                        const title = escapeOverlay('Marker ' + k.m.n + (k.m.name ? ' — ' + k.m.name : '') + ' · ' + formatClockTenths(k.m.time))
+                            .replace(/"/g, '&quot;');
+                        out += '<span class="tx-mk" data-marker-id="' + k.m.id + '" title="' + title + '">' +
+                            '<span class="tx-mk-pill" style="left:' + (stack++ * 20) + 'px">' + k.m.n + '</span></span>';
+                    }
+                    if (hasHl && !inHl && s >= hs && s < he) { out += '<span class="' + overlayHighlight.cls + '">'; inHl = true; }
+                    let e = seg.e;
+                    if (li < labels.length) e = Math.min(e, labels[li].pos);
+                    if (mi < mks.length) e = Math.min(e, mks[mi].pos);
+                    if (hasHl && s < hs) e = Math.min(e, hs);
+                    if (inHl) e = Math.min(e, he);
+                    const piece = escapeOverlay(text.slice(s, e));
+                    out += seg.dim ? '<span class="tx-dim">' + piece + '</span>' : piece;
+                    s = e;
+                }
+            }
+            if (inHl) out += '</span>';
+            hl.innerHTML = out;
+            hl.scrollTop = ta.scrollTop;
+            hl.scrollLeft = ta.scrollLeft;
+            updateJumpButton();
+        }
+
+        // Vertical extent (in scroll-content coordinates) of the highlighted range, or null.
+        function highlightExtent() {
+            const hl = document.getElementById('highlight-layer');
+            const el = hl && hl.querySelector('.range-body, mark');
+            if (!el) return null;
+            const rects = el.getClientRects();
+            if (!rects.length) return null;
+            const base = hl.getBoundingClientRect();
+            const origin = base.top + hl.clientTop - hl.scrollTop;
+            return { top: rects[0].top - origin, bottom: rects[rects.length - 1].bottom - origin };
+        }
+
+        // Scroll so the highlighted range sits in the vertical middle of the box (a range taller
+        // than the box gets its top aligned instead). Used for programmatic selection changes only.
+        function scrollHighlightToCenter() {
+            const ta = document.getElementById('transcription-text');
+            const hl = document.getElementById('highlight-layer');
+            const ext = highlightExtent();
+            if (!ta || !hl || !ext || !ta.clientHeight) return;
+            const h = ext.bottom - ext.top;
+            const target = h > ta.clientHeight * 0.8 ? ext.top - 24 : (ext.top + ext.bottom) / 2 - ta.clientHeight / 2;
+            ta.scrollTop = Math.max(0, target);
+            hl.scrollTop = ta.scrollTop;
+            hl.scrollLeft = ta.scrollLeft;
+            updateJumpButton();
+        }
+
+        // The "scroll to selection" button shows only while the highlighted range is out of view.
+        function updateJumpButton() {
+            const btn = document.getElementById('tx-jump-btn');
+            const ta = document.getElementById('transcription-text');
+            if (!btn || !ta) return;
+            const ext = highlightExtent();
+            const hidden = !!ext && ta.clientHeight > 0 &&
+                (ext.bottom <= ta.scrollTop || ext.top >= ta.scrollTop + ta.clientHeight);
+            btn.classList.toggle('visible', hidden);
+        }
+
+        // Regex that matches `str` with any run of whitespace (a space or the line/paragraph breaks
+        // the layout inserted) standing in for any whitespace run in the text.
+        function flexibleRegex(str) {
+            const esc = str.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+            return new RegExp(esc, 'gi');
+        }
+
         function performSearch(fromNavigation = false) {
             const searchBox = document.getElementById('search-box');
             const searchTerm = searchBox.value.trim();
@@ -1864,7 +2103,7 @@
                 searchActive = false;
                 resultsLabel.textContent = '';
                 textArea.setSelectionRange(0, 0);
-                highlightLayer.innerHTML = ''; // Clear highlights
+                setOverlayHighlight(null); // Clear highlights
                 return;
             }
             
@@ -1872,19 +2111,16 @@
             searchActive = true;
             
             const text = textArea.value;
-            const lowerText = text.toLowerCase();
-            const lowerSearchTerm = searchTerm.toLowerCase();
-            
-            // Find all occurrences
-            let position = 0;
+
+            // Find all occurrences (a space in the term also matches a sentence/paragraph break)
+            const searchRe = flexibleRegex(searchTerm);
             let matchCount = 0;
-            
-            while ((position = lowerText.indexOf(lowerSearchTerm, position)) !== -1) {
+            let sm;
+            while ((sm = searchRe.exec(text)) !== null) {
                 searchResults.push({
-                    start: position,
-                    end: position + searchTerm.length
+                    start: sm.index,
+                    end: sm.index + sm[0].length
                 });
-                position += searchTerm.length;
                 matchCount++;
             }
             
@@ -1902,7 +2138,7 @@
             } else {
                 resultsLabel.textContent = 'No results';
                 textArea.setSelectionRange(0, 0);
-                highlightLayer.innerHTML = ''; // Clear highlights
+                setOverlayHighlight(null); // Clear highlights
             }
         }
         
@@ -1931,17 +2167,8 @@
             }
             
             const textArea = document.getElementById('transcription-text');
-            const highlightLayer = document.getElementById('highlight-layer');
             const resultsLabel = document.getElementById('search-results-label');
             const match = searchResults[currentSearchIndex];
-            
-            // Sync highlight layer styles with textarea
-            const computedStyle = window.getComputedStyle(textArea);
-            highlightLayer.style.fontFamily = computedStyle.fontFamily;
-            highlightLayer.style.fontSize = computedStyle.fontSize;
-            highlightLayer.style.lineHeight = computedStyle.lineHeight;
-            highlightLayer.style.letterSpacing = computedStyle.letterSpacing;
-            highlightLayer.style.wordSpacing = computedStyle.wordSpacing;
             
             // Set the selection to highlight the match
             textArea.setSelectionRange(match.start, match.end);
@@ -1951,19 +2178,9 @@
                 textArea.focus();
             }
             
-            // Update highlight layer to show visual highlight
-            const text = textArea.value;
-            let highlightedHTML = '';
-            
-            // Build HTML with highlighted match
-            highlightedHTML += escapeHTML(text.substring(0, match.start));
-            highlightedHTML += '<mark>' + escapeHTML(text.substring(match.start, match.end)) + '</mark>';
-            highlightedHTML += escapeHTML(text.substring(match.end));
-            
-            highlightLayer.innerHTML = highlightedHTML;
-            
-            // Scroll to make the selection visible (accurate for soft-wrapped text)
-            scrollHighlightIntoView(highlightLayer.querySelector('mark'));
+            // Draw the match and centre it in the box
+            setOverlayHighlight({ start: match.start, end: match.end, cls: 'mark' });
+            scrollHighlightToCenter();
             
             // Update results label (timing shown in waveform controls)
             resultsLabel.textContent = `${currentSearchIndex + 1}/${searchResults.length}`;
@@ -1985,7 +2202,7 @@
             }
             
             // Normalize search text (same as in findFirstMatchingChunk)
-            const searchLower = selectedText.trim().toLowerCase().replace(/\n/g, '');
+            const searchLower = selectedText.trim().toLowerCase().replace(/\s+/g, ' ');
             
             const matches = [];
             let startPos = 0;
@@ -2057,6 +2274,7 @@
             textArea.addEventListener('scroll', () => {
                 highlightLayer.scrollTop = textArea.scrollTop;
                 highlightLayer.scrollLeft = textArea.scrollLeft;
+                updateJumpButton();
             });
             
             // Icon toggles between magnifying glass (empty) and × (has text)
@@ -2134,10 +2352,8 @@
                 // Escape key clears search
                 if (e.key === 'Escape' && searchActive) {
                     const searchBox = document.getElementById('search-box');
-                    const highlightLayer = document.getElementById('highlight-layer');
                     searchBox.value = '';
-                    highlightLayer.innerHTML = ''; // Clear highlights
-                    performSearch(); // This will clear the search
+                    performSearch(); // This will clear the search (and the highlights)
                 }
             });
             
@@ -2148,14 +2364,13 @@
                 // If user makes a manual selection while search is active, switch to manual mode
                 if (searchActive && selectedText) {
                     const searchBox = document.getElementById('search-box');
-                    const highlightLayer = document.getElementById('highlight-layer');
                     const searchTerm = searchBox.value.trim();
                     
                     // Check if the selection is different from the current search term
                     if (selectedText.toLowerCase() !== searchTerm.toLowerCase()) {
                         searchActive = false;
                         searchBox.value = ''; // Clear search box
-                        highlightLayer.innerHTML = ''; // Clear highlights
+                        setOverlayHighlight(null); // Clear highlights
                     }
                 }
                 
@@ -2171,14 +2386,13 @@
                 // If user makes a manual selection while search is active, switch to manual mode
                 if (searchActive && selectedText) {
                     const searchBox = document.getElementById('search-box');
-                    const highlightLayer = document.getElementById('highlight-layer');
                     const searchTerm = searchBox.value.trim();
                     
                     // Check if the selection is different from the current search term
                     if (selectedText.toLowerCase() !== searchTerm.toLowerCase()) {
                         searchActive = false;
                         searchBox.value = ''; // Clear search box
-                        highlightLayer.innerHTML = ''; // Clear highlights
+                        setOverlayHighlight(null); // Clear highlights
                     }
                 }
                 
@@ -2194,33 +2408,33 @@
             const resultsLabel = document.getElementById('search-results-label');
             const prevBtn = document.getElementById('prev-btn');
             const nextBtn = document.getElementById('next-btn');
-            const selectedText = textArea.value.substring(textArea.selectionStart, textArea.selectionEnd).trim();
+            const rawSelection = textArea.value.substring(textArea.selectionStart, textArea.selectionEnd);
+            const selectedText = rawSelection.trim();
             
             if (!selectedText) return;
             
-            // Find all occurrences of the selected text
+            // Find all occurrences of the selected text (whitespace-flexible: the selection may
+            // span the line/paragraph breaks the layout inserted)
             const text = textArea.value;
-            const lowerText = text.toLowerCase();
-            const lowerSelected = selectedText.toLowerCase();
             
             searchResults = []; // Store results for navigation
-            let position = 0;
             let matchCount = 0;
             let currentPosition = -1;
             
-            const selectionStart = textArea.selectionStart;
+            const selectionStart = textArea.selectionStart + (rawSelection.length - rawSelection.trimStart().length);
             
-            while ((position = lowerText.indexOf(lowerSelected, position)) !== -1) {
+            const selRe = flexibleRegex(selectedText);
+            let mm;
+            while ((mm = selRe.exec(text)) !== null) {
                 searchResults.push({
-                    start: position,
-                    end: position + selectedText.length
+                    start: mm.index,
+                    end: mm.index + mm[0].length
                 });
                 matchCount++;
-                if (position === selectionStart) {
+                if (mm.index === selectionStart) {
                     currentPosition = matchCount;
                     currentSearchIndex = matchCount - 1;
                 }
-                position += selectedText.length;
             }
             
             // Enable/disable navigation buttons based on match count
@@ -2247,6 +2461,7 @@
             audioSource: null,
             audioContext: null,
             pausedAt: null,      // absolute time in the source buffer, or null
+            cueTime: null,       // where the space bar plays from: last waveform click / marker jump
             playPos: null,       // absolute playhead time while playing
             lastFrameAt: null,   // audioContext.currentTime at the last animatePlayhead frame
             isPlaying: false,
@@ -2434,6 +2649,9 @@
             ctx.stroke();
 
             populateTextOverlay();
+            positionMarkers();
+            // The zoom window may have changed: re-dim the transcript words outside it.
+            renderOverlay();
         }
         
         // Helper function to convert hex to RGB
@@ -2706,6 +2924,7 @@
 
             updateSelectionBand();
             populateTextOverlay();
+            positionMarkers();
         }
         
         // Document/canvas drag listeners are re-created on every setupDragHandlers call; keep
@@ -2839,9 +3058,11 @@
             previewState.isPlaying = false;
             releaseAudioContext();
 
-            // Store the seek position (absolute time in the source buffer)
+            // Store the seek position (absolute time in the source buffer). It is also the cue the
+            // space bar plays from and returns to.
             previewState.pausedAt = absoluteTime;
             previewState.playPos = absoluteTime;
+            previewState.cueTime = absoluteTime;
             previewState.isPaused = true;
 
             // Position the playhead (window-relative, like the handles)
@@ -2897,10 +3118,21 @@
         };
 
         // Toggle playback of preview
+        // The space bar plays from the cue point — the last waveform click or marker jump, or the
+        // selection start when there is none — and, while playing, stops and returns there, so a
+        // second tap replays the same passage instead of resuming mid-way. The Play/Pause buttons
+        // keep their resume-in-place behaviour.
+        function cuePoint() {
+            const c = previewState.cueTime;
+            return (c != null && c >= previewState.startTime && c < previewState.endTime) ? c : previewState.startTime;
+        }
         window.togglePreviewPlayback = function() {
+            const cue = cuePoint();
             if (previewState.isPlaying) {
                 pausePreview();
+                seekToTime(cue);
             } else {
+                seekToTime(cue);
                 playPreview();
             }
         };
@@ -3098,7 +3330,7 @@
             const { windowStart, windowEnd } = computeWindow(previewState.startTime, previewState.endTime);
             previewState.windowStart = windowStart;
             previewState.windowEnd = windowEnd;
-            drawWaveform().then(() => updateHandlePositions());
+            drawWaveform().then(() => { updateHandlePositions(); scrollHighlightToCenter(); });
         };
 
         function enterOverviewMode() {
@@ -3106,10 +3338,11 @@
             selectionAudioMatches = [];
             selectionAudioIndex = 0;
             if (!originalAudioBuffer) return;
-            // A new selection restarts playback from its start (and clears any stale pause point,
-            // which is an absolute time inside the *previous* selection).
+            // A new selection restarts playback from its start (and clears any stale pause point
+            // and cue, which are absolute times inside the *previous* selection).
             const wasPlaying = previewState.isPlaying;
             if (previewState.isPlaying || previewState.isPaused) stopPreview();
+            previewState.cueTime = null;
             previewState.windowStart = 0;
             previewState.windowEnd = originalAudioBuffer.duration;
             previewState.startTime = 0;
@@ -3133,7 +3366,7 @@
             drawWaveform().then(() => {
                 updateHandlePositions();
                 setupDragHandlers();
-                updateTextHighlightFromTime();
+                updateTextHighlightFromTime(true);
             });
         }
 
@@ -3149,11 +3382,12 @@
             handleTranscriptionSelection(); // highlight + zoom + handles + enable Create Slice
         }
 
-        function enterSelectionMode(startTime, endTime) {
-            // A new selection restarts playback from its start (and clears any stale pause point,
-            // which is an absolute time inside the *previous* selection).
+        function enterSelectionMode(startTime, endTime, { fromUser = false } = {}) {
+            // A new selection restarts playback from its start (and clears any stale pause point
+            // and cue, which are absolute times inside the *previous* selection).
             const wasPlaying = previewState.isPlaying;
             if (previewState.isPlaying || previewState.isPaused) stopPreview();
+            previewState.cueTime = null;
 
             const { windowStart, windowEnd } = computeWindow(startTime, endTime);
             previewState.startTime = startTime;
@@ -3174,31 +3408,13 @@
             drawWaveform().then(() => {
                 updateHandlePositions();
                 setupDragHandlers();
-                updateTextHighlightFromTime();
+                updateTextHighlightFromTime(!fromUser);
             });
         }
 
-        // Scroll the textarea + overlay so `span` (a node inside #highlight-layer) is visible.
-        // Only scrolls when the target is above/below the current view, so a manually-selected
-        // (already-visible) word is left in place. offsetTop is accurate for soft-wrapped text.
-        function scrollHighlightIntoView(span) {
-            const ta = document.getElementById('transcription-text');
-            const hl = document.getElementById('highlight-layer');
-            if (!ta || !hl || !span) return;
-            const top = span.offsetTop;
-            const bottom = top + span.offsetHeight;
-            const viewTop = ta.scrollTop;
-            const viewBottom = viewTop + ta.clientHeight;
-            let next = viewTop;
-            if (top < viewTop) next = top - 8;
-            else if (bottom > viewBottom) next = bottom - ta.clientHeight + 8;
-            next = Math.max(0, next);
-            ta.scrollTop = next;
-            hl.scrollTop = ta.scrollTop;
-            hl.scrollLeft = ta.scrollLeft;
-        }
-
-        function updateTextHighlightFromTime() {
+        // `scroll`: centre the highlighted range in the box. Only programmatic selection changes ask
+        // for it; resizes, handle drags and the user's own mouse selection leave the scroll alone.
+        function updateTextHighlightFromTime(scroll = false) {
             const tr = activeTranscription();
             if (!tr) return;
             const chunks = tr.chunks || tr.allTokens;
@@ -3221,70 +3437,59 @@
             if (!ta) return;
 
             const text = ta.value;
-            let charPos = 0;
             let firstChunkStart = -1;
             let lastChunkEnd = -1;
 
-            for (const chunk of chunks) {
-                const chunkText = chunk.text?.trim();
-                if (!chunkText || !chunk.timestamp) continue;
-                const t0 = chunk.timestamp[0];
-                const t1 = chunk.timestamp[1];
-                const idx = text.indexOf(chunkText, charPos);
-                if (idx === -1) continue;
-                if (t0 < previewState.endTime && t1 > previewState.startTime) {
-                    if (firstChunkStart === -1) firstChunkStart = idx;
-                    lastChunkEnd = idx + chunkText.length;
+            if (transcriptLayout && transcriptLayout.text === text && transcriptLayout.chunks === chunks) {
+                // Offsets are already known from the layout
+                for (const w of transcriptLayout.words) {
+                    const t = w.c.timestamp;
+                    if (!t) continue;
+                    if (t[0] < previewState.endTime && t[1] > previewState.startTime) {
+                        if (firstChunkStart === -1) firstChunkStart = w.s;
+                        lastChunkEnd = w.e;
+                    }
                 }
-                charPos = idx + 1;
-            }
-
-            const highlightLayer = document.getElementById('highlight-layer');
-            if (!highlightLayer) return;
-
-            const computedStyle = window.getComputedStyle(ta);
-            highlightLayer.style.fontFamily = computedStyle.fontFamily;
-            highlightLayer.style.fontSize = computedStyle.fontSize;
-            highlightLayer.style.lineHeight = computedStyle.lineHeight;
-            highlightLayer.style.letterSpacing = computedStyle.letterSpacing;
-            highlightLayer.style.wordSpacing = computedStyle.wordSpacing;
-
-            if (firstChunkStart === -1) {
-                highlightLayer.innerHTML = escapeHTML(text);
-                return;
+            } else {
+                let charPos = 0;
+                for (const chunk of chunks) {
+                    const chunkText = chunk.text?.trim();
+                    if (!chunkText || !chunk.timestamp) continue;
+                    const t0 = chunk.timestamp[0];
+                    const t1 = chunk.timestamp[1];
+                    const idx = text.indexOf(chunkText, charPos);
+                    if (idx === -1) continue;
+                    if (t0 < previewState.endTime && t1 > previewState.startTime) {
+                        if (firstChunkStart === -1) firstChunkStart = idx;
+                        lastChunkEnd = idx + chunkText.length;
+                    }
+                    charPos = idx + 1;
+                }
             }
 
             // One span for the whole range: an even accent tint, with the green/red start and end
             // markers drawn as inset box-shadows (see .range-body) rather than per-word fills.
-            highlightLayer.innerHTML =
-                escapeHTML(text.substring(0, firstChunkStart)) +
-                '<span class="range-body">' + escapeHTML(text.substring(firstChunkStart, lastChunkEnd)) + '</span>' +
-                escapeHTML(text.substring(lastChunkEnd));
+            overlayHighlight = firstChunkStart === -1 ? null : { start: firstChunkStart, end: lastChunkEnd, cls: 'range-body' };
+            renderOverlay();
+            if (firstChunkStart === -1) return;
 
             if (document.activeElement === ta && ta.selectionStart !== ta.selectionEnd) {
                 ta.setSelectionRange(ta.selectionEnd, ta.selectionEnd);
             }
-            scrollHighlightIntoView(highlightLayer.querySelector('.range-body'));
+            if (scroll) scrollHighlightToCenter();
         }
 
         function applySelectionHighlight(start, end) {
             const textArea = document.getElementById('transcription-text');
-            const highlightLayer = document.getElementById('highlight-layer');
-            const text = textArea.value;
-            const computedStyle = window.getComputedStyle(textArea);
-            highlightLayer.style.fontFamily = computedStyle.fontFamily;
-            highlightLayer.style.fontSize = computedStyle.fontSize;
-            highlightLayer.style.lineHeight = computedStyle.lineHeight;
             textArea.focus();
             textArea.setSelectionRange(start, end);
-            highlightLayer.innerHTML =
-                escapeHTML(text.substring(0, start)) +
-                '<mark>' + escapeHTML(text.substring(start, end)) + '</mark>' +
-                escapeHTML(text.substring(end));
-            scrollHighlightIntoView(highlightLayer.querySelector('mark'));
+            setOverlayHighlight({ start, end, cls: 'mark' });
+            scrollHighlightToCenter();
         }
 
-        function handleTranscriptionSelection() {
+        // `fromUser`: the selection came from the user's own mouse/keyboard in the textarea, so the
+        // box is left where it is (they're already looking at it).
+        function handleTranscriptionSelection(fromUser = false) {
             if (!currentTranscription || !originalAudioBuffer) return;
             const ta = document.getElementById('transcription-text');
             const userSelStart = ta.selectionStart;
@@ -3295,16 +3500,13 @@
             if (!matches || matches.length === 0) { enterOverviewMode(); return; }
 
             // Annotate each audio match with its char position in the textarea text
-            const textLower = ta.value.toLowerCase();
-            const selLower = sel.toLowerCase();
-            let searchPos = 0;
+            const selRe = flexibleRegex(sel);
+            let selMatch;
             for (const m of matches) {
-                const idx = textLower.indexOf(selLower, searchPos);
-                if (idx !== -1) {
-                    m.charStart = idx;
-                    m.charEnd = idx + sel.length;
-                    searchPos = idx + 1;
-                }
+                if (!(selMatch = selRe.exec(ta.value))) break;
+                m.charStart = selMatch.index;
+                m.charEnd = selMatch.index + selMatch[0].length;
+                selRe.lastIndex = selMatch.index + 1;
             }
 
             // Find the match closest to where the user actually selected
@@ -3335,20 +3537,22 @@
                 document.getElementById('create-slice-btn').disabled = false;
             }
             const match = matches[bestIndex];
-            enterSelectionMode(match.startTime / 1000, match.endTime / 1000);
+            enterSelectionMode(match.startTime / 1000, match.endTime / 1000, { fromUser });
         }
 
         document.addEventListener('mouseup', (e) => {
-            if (e.target.id === 'transcription-text') handleTranscriptionSelection();
+            if (e.target.id === 'transcription-text') handleTranscriptionSelection(true);
         });
         document.addEventListener('keyup', (e) => {
-            if (e.target.id === 'transcription-text') handleTranscriptionSelection();
+            // Transport keys (space, marker keys) aren't a selection change: re-deriving the
+            // selection here would restart playback from the selection start and undo the
+            // play/stop, jump or marker the key just made.
+            if (e.key === ' ' || e.key === 'm' || e.key === '[' || e.key === ']') return;
+            if (e.target.id === 'transcription-text') handleTranscriptionSelection(true);
         });
         document.addEventListener('mousedown', (e) => {
             if (e.target.closest('.textarea-wrapper') || e.target.closest('#transcription-waveform-section')) return;
-            const _hl = document.getElementById('highlight-layer');
-            const _ta = document.getElementById('transcription-text');
-            if (_hl && _ta && _hl.querySelector('mark')) _hl.innerHTML = escapeHTML(_ta.value);
+            if (overlayHighlight && overlayHighlight.cls === 'mark') setOverlayHighlight(null);
         });
 
         document.addEventListener('click', (e) => {
@@ -3400,6 +3604,396 @@
                 requestAnimationFrame(animatePlayhead);
             }
         }
+
+        // ── Markers ────────────────────────────────────────────────────────────────────────────
+        // Transcription tab only (never the inline slice editor). A marker is a point in the tab's
+        // file: a blue line on the waveform, a blue tag in the transcript, a row in the Markers pane.
+        const MARKER_MIN_GAP = 0.1;   // seconds; a second marker this close to one is ignored
+        const MARKERS_PANE_COLLAPSED_KEY = 'vocalslice-markers-pane-collapsed';
+        let markersPaneCollapsed = false;
+        try { markersPaneCollapsed = localStorage.getItem(MARKERS_PANE_COLLAPSED_KEY) === '1'; } catch { /* storage off */ }
+
+        // m:ss.s, rounded to the nearest tenth (carrying into the seconds, so 59.96 → 1:00.0).
+        function formatClockTenths(sec) {
+            const tenths = Math.round(Math.max(0, sec || 0) * 10);
+            return formatClock(Math.floor(tenths / 10)) + '.' + (tenths % 10);
+        }
+
+        const sortedMarkers = () => markers.slice().sort((a, b) => a.time - b.time || a.n - b.n);
+        const findMarker = (id) => markers.find(m => m.id === id) || null;
+
+        // Where the playhead is: live while playing, the pause/seek point when paused, else the
+        // selection start (or the window start with no selection).
+        function currentPlayheadTime() {
+            const p = previewState;
+            if (p.isPlaying && p.playPos != null) return p.playPos;
+            if (p.pausedAt != null) return p.pausedAt;
+            return p.endTime > p.startTime ? p.startTime : p.windowStart;
+        }
+
+        // Shared guard for M / [ / ]: Transcription tab, audio loaded, editor modal closed.
+        const markersAvailable = () => !inModal() && waveformContext === 'transcription' &&
+            !!originalAudioBuffer && previewPaneVisible();
+
+        window.addMarkerAtPlayhead = function() {
+            if (!markersAvailable()) return;
+            const t = Math.max(0, Math.min(originalAudioBuffer.duration, currentPlayheadTime()));
+            if (markers.some(m => Math.abs(m.time - t) < MARKER_MIN_GAP)) {
+                showToast('Marker already here', { icon: 'ph ph-bookmark-simple' });
+                return;
+            }
+            const n = nextMarkerNumber++;
+            markers.push({ id: 'mk' + Date.now().toString(36) + n, time: t, n, name: '' });
+            markersChanged();
+        };
+
+        function deleteMarker(id) {
+            const i = markers.findIndex(m => m.id === id);
+            if (i === -1) return;
+            markers.splice(i, 1);
+            markersChanged();
+        }
+
+        function renameMarker(id, name) {
+            const m = findMarker(id);
+            if (!m) { renderMarkersPane(); return; }   // deleted/cleared while being renamed
+            const v = (name || '').trim().slice(0, 80);
+            if (v === m.name) { renderMarkersPane(); return; }
+            m.name = v;
+            markersChanged();
+        }
+
+        // New file / demo exit / Clear Session Data. Doesn't save: each caller persists (or
+        // deliberately doesn't) on its own terms.
+        function clearMarkers() {
+            markers = [];
+            nextMarkerNumber = 1;
+            closeMarkerMenu();
+            refreshMarkerViews();
+        }
+
+        function restoreMarkers(sessionState) {
+            const saved = Array.isArray(sessionState?.markers) ? sessionState.markers : [];
+            markers = saved
+                .filter(m => m && Number.isFinite(m.time) && m.time >= 0 && Number.isFinite(m.n))
+                .map(m => ({ id: String(m.id || ('mk' + m.n)), time: m.time, n: m.n, name: String(m.name || '') }));
+            const maxN = markers.reduce((a, m) => Math.max(a, m.n), 0);
+            nextMarkerNumber = Math.max(Number(sessionState?.nextMarkerNumber) || 1, maxN + 1);
+            refreshMarkerViews();
+        }
+
+        function refreshMarkerViews() {
+            positionMarkers();
+            renderMarkersPane();
+            renderOverlay(true);
+        }
+
+        function markersChanged() {
+            refreshMarkerViews();
+            saveSessionState();
+        }
+
+        // Transcript anchor for each marker: the first word starting at/after its time, else the
+        // last word. Sorted by text position for renderOverlay's single pass.
+        function markerTagPositions(L) {
+            if (!markers.length || !L.words.length) return [];
+            const out = [];
+            for (const m of markers) {
+                let w = L.words.find(w => w.c.timestamp && w.c.timestamp[0] >= m.time - 1e-3);
+                if (!w) w = L.words[L.words.length - 1];
+                out.push({ pos: w.s, m });
+            }
+            return out.sort((a, b) => a.pos - b.pos || a.m.time - b.m.time || a.m.n - b.m.n);
+        }
+
+        // Waveform lines, positioned window-relative exactly like the playhead and handles.
+        function positionMarkers() {
+            const layer = document.getElementById('waveform-markers');
+            if (!layer || waveformContext !== 'transcription') return;
+            const canvas = document.getElementById('waveform-canvas');
+            const ws = previewState.windowStart, we = previewState.windowEnd;
+            const width = canvas ? canvas.clientWidth : 0;
+            if (!originalAudioBuffer || !markers.length || !width || we <= ws) { layer.innerHTML = ''; return; }
+            let html = '';
+            for (const m of sortedMarkers()) {
+                if (m.time < ws || m.time > we) continue;
+                const x = ((m.time - ws) / (we - ws)) * width;
+                const title = ('Marker ' + m.n + (m.name ? ' — ' + m.name : '') + ' · ' + formatClockTenths(m.time))
+                    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+                // Line and tag are siblings, not nested: the line stays under the handles while the
+                // tag rides over the word labels — a nested tag would be capped by the line's z-index.
+                html += `<div class="waveform-marker" data-marker-id="${m.id}" style="left:${x.toFixed(1)}px" title="${title}"></div>` +
+                    `<span class="waveform-marker-tag" data-marker-id="${m.id}" style="left:${x.toFixed(1)}px" title="${title}">${m.n}</span>`;
+            }
+            layer.innerHTML = html;
+        }
+
+        // ── Navigation ──
+        // Playback only runs inside the selection, so a marker outside it widens the selection to
+        // the whole file; a marker outside the zoom window pans the window (zoom level kept).
+        async function jumpToMarker(m) {
+            if (!m || !markersAvailable()) return;
+            closeMarkerMenu();
+            const t = m.time;
+            const dur = originalAudioBuffer.duration;
+            let widened = false, moved = false;
+            if (t < previewState.startTime || t >= previewState.endTime) {
+                previewState.startTime = 0;
+                previewState.endTime = dur;
+                const { startInput, endInput, startHandle, endHandle, selection } = getWaveformEls();
+                startInput.value = (0).toFixed(2);
+                endInput.value = dur.toFixed(2);
+                startHandle.style.display = 'block';
+                endHandle.style.display = 'block';
+                if (selection) selection.style.display = 'block';
+                updateDurationDisplay();
+                applyPlaybackRange();
+                if (previewState.editingSliceIndex === null) document.getElementById('create-slice-btn').disabled = false;
+                widened = moved = true;
+            }
+            const ws = previewState.windowStart, we = previewState.windowEnd;
+            if (t < ws || t > we) {
+                const w = Math.min(dur, we - ws);
+                const ns = Math.max(0, Math.min(dur - w, t - w * 0.25));
+                previewState.windowStart = ns;
+                previewState.windowEnd = ns + w;
+                moved = true;
+            }
+            seekToTime(t);
+            if (moved) {
+                await drawWaveform();
+                updateHandlePositions();
+                if (widened) updateTextHighlightFromTime(false);
+            }
+            scrollTranscriptToMarker(m.id);
+        }
+
+        // Bring a marker's transcript tag into view (centred) if it's off-screen.
+        function scrollTranscriptToMarker(id) {
+            const ta = document.getElementById('transcription-text');
+            const hl = document.getElementById('highlight-layer');
+            const tag = hl && hl.querySelector(`.tx-mk[data-marker-id="${id}"]`);
+            if (!ta || !tag || !ta.clientHeight) return;
+            const base = hl.getBoundingClientRect();
+            const top = tag.getBoundingClientRect().top - (base.top + hl.clientTop - hl.scrollTop);
+            if (top >= ta.scrollTop + 8 && top <= ta.scrollTop + ta.clientHeight - 40) return;
+            ta.scrollTop = Math.max(0, top - ta.clientHeight / 2);
+            hl.scrollTop = ta.scrollTop;
+            hl.scrollLeft = ta.scrollLeft;
+            updateJumpButton();
+        }
+
+        function jumpToAdjacentMarker(dir) {
+            if (!markers.length || !markersAvailable()) return;
+            const cur = currentPlayheadTime();
+            const list = sortedMarkers();
+            // A small back-off so [ while playing just past a marker reaches the one before it.
+            const target = dir < 0
+                ? list.filter(m => m.time < cur - (previewState.isPlaying ? 0.3 : 0.05)).pop()
+                : list.find(m => m.time > cur + 0.05);
+            if (target) jumpToMarker(target);
+        }
+
+        function selectToNextMarker(id) {
+            const m = findMarker(id);
+            if (!m || !markersAvailable()) return;
+            closeMarkerMenu();
+            const list = sortedMarkers();
+            const next = list.find(x => x.time > m.time + 1e-3);
+            const end = next ? next.time : originalAudioBuffer.duration;
+            if (end - m.time < 0.05) return;
+            if (previewState.editingSliceIndex === null) document.getElementById('create-slice-btn').disabled = false;
+            enterSelectionMode(m.time, end);
+        }
+
+        // ── Markers pane ──
+        window.toggleMarkersPane = function() {
+            markersPaneCollapsed = !markersPaneCollapsed;
+            try { localStorage.setItem(MARKERS_PANE_COLLAPSED_KEY, markersPaneCollapsed ? '1' : '0'); } catch { /* storage off */ }
+            renderMarkersPane();
+        };
+
+        function renderMarkersPane() {
+            const pane = document.getElementById('markers-pane');
+            const list = document.getElementById('markers-list');
+            const btn = document.getElementById('markers-pane-btn');
+            if (!pane || !list) return;
+            // A rebuild would discard an open rename editor: commit it first (it re-renders itself).
+            if (commitOpenRename) { commitOpenRename(); return; }
+            const has = markers.length > 0;
+            pane.classList.toggle('visible', has && !markersPaneCollapsed);
+            if (btn) {
+                btn.disabled = !has;
+                btn.classList.toggle('pane-open', has && !markersPaneCollapsed);
+                btn.title = !has ? 'Markers list (add a marker first)'
+                    : markersPaneCollapsed ? 'Show markers list' : 'Hide markers list';
+            }
+            const count = document.getElementById('markers-count');
+            if (count) count.textContent = has ? String(markers.length) : '';
+            list.innerHTML = '';
+            for (const m of sortedMarkers()) {
+                const row = document.createElement('div');
+                row.className = 'marker-row';
+                row.setAttribute('role', 'listitem');
+                row.dataset.markerId = m.id;
+                row.title = 'Click to jump · double-click the name to rename · right-click for more';
+                const num = document.createElement('span');
+                num.className = 'marker-num';
+                num.textContent = m.n;
+                const time = document.createElement('span');
+                time.className = 'marker-time';
+                time.textContent = formatClockTenths(m.time);
+                const name = document.createElement('span');
+                name.className = 'marker-name';
+                name.textContent = m.name;
+                const sel = document.createElement('button');
+                sel.type = 'button';
+                sel.className = 'marker-select-btn';
+                sel.title = 'Select to next marker';
+                sel.setAttribute('aria-label', 'Select to next marker');
+                sel.innerHTML = '<i class="ph ph-arrows-out-line-horizontal"></i>';
+                row.append(num, time, name, sel);
+                list.appendChild(row);
+            }
+        }
+
+        // Inline rename in the pane. Enter / blur commits, Escape cancels.
+        let commitOpenRename = null;   // commits the editor currently open, if any
+        function startMarkerRename(id) {
+            const m = findMarker(id);
+            if (!m) return;
+            closeMarkerMenu();
+            // Commit any rename already open first: its commit re-renders the list, which would
+            // otherwise throw away the editor we're about to create.
+            if (commitOpenRename) commitOpenRename();
+            if (markersPaneCollapsed) window.toggleMarkersPane();
+            const nameEl = document.querySelector(`#markers-list .marker-row[data-marker-id="${id}"] .marker-name`);
+            if (!nameEl) return;
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.className = 'marker-name-input';
+            input.value = m.name;
+            input.maxLength = 80;
+            input.placeholder = 'Marker ' + m.n;
+            let done = false;
+            const finish = (commit) => {
+                if (done) return;
+                done = true;
+                if (commitOpenRename === commitThis) commitOpenRename = null;
+                if (commit) renameMarker(id, input.value); else renderMarkersPane();
+            };
+            const commitThis = () => finish(true);
+            commitOpenRename = commitThis;
+            input.addEventListener('keydown', (e) => {
+                e.stopPropagation();
+                if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+                else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+            });
+            input.addEventListener('blur', () => finish(true));
+            input.addEventListener('click', (e) => e.stopPropagation());
+            input.addEventListener('dblclick', (e) => e.stopPropagation());
+            nameEl.replaceWith(input);
+            input.focus();
+            input.select();
+        }
+
+        // ── Context menu (in-app DOM, theme-styled) ──
+        function closeMarkerMenu() {
+            document.getElementById('marker-menu')?.remove();
+        }
+
+        function openMarkerMenu(id, x, y) {
+            closeMarkerMenu();
+            const m = findMarker(id);
+            if (!m) return;
+            const menu = document.createElement('div');
+            menu.id = 'marker-menu';
+            menu.className = 'marker-menu';
+            menu.setAttribute('role', 'menu');
+            const head = document.createElement('div');
+            head.className = 'marker-menu-head';
+            head.textContent = 'Marker ' + m.n + ' · ' + formatClockTenths(m.time);
+            menu.appendChild(head);
+            const items = [
+                ['ph ph-pencil-simple', 'Rename', () => startMarkerRename(id)],
+                ['ph ph-arrows-out-line-horizontal', 'Select to next marker', () => selectToNextMarker(id)],
+                ['ph ph-trash', 'Delete', () => { closeMarkerMenu(); deleteMarker(id); }, 'danger'],
+            ];
+            for (const [icon, label, fn, cls] of items) {
+                const b = document.createElement('button');
+                b.type = 'button';
+                b.className = 'marker-menu-item' + (cls ? ' ' + cls : '');
+                b.setAttribute('role', 'menuitem');
+                b.innerHTML = `<i class="${icon}"></i>`;
+                b.appendChild(document.createTextNode(label));
+                b.addEventListener('click', (e) => { e.stopPropagation(); closeMarkerMenu(); fn(); });
+                menu.appendChild(b);
+            }
+            document.body.appendChild(menu);
+            // Keep it on screen.
+            const r = menu.getBoundingClientRect();
+            menu.style.left = Math.max(4, Math.min(x, window.innerWidth - r.width - 4)) + 'px';
+            menu.style.top = Math.max(4, Math.min(y, window.innerHeight - r.height - 4)) + 'px';
+        }
+
+        // One delegate for every marker surface: waveform line/tag, transcript tag, pane row.
+        const markerIdFrom = (target) =>
+            target.closest?.('.waveform-marker, .waveform-marker-tag, .tx-mk, .marker-row')?.dataset.markerId || null;
+        // Event targets can be the document or a text node; only Elements have closest().
+        const closestEl = (target, sel) => (target instanceof Element ? target.closest(sel) : null);
+
+        document.addEventListener('click', (e) => {
+            if (closestEl(e.target, '#marker-menu, .marker-name-input')) return;
+            const id = markerIdFrom(e.target);
+            if (!id) return;
+            // Capture phase: a click on a marker line must not also reach the canvas underneath.
+            e.preventDefault();
+            e.stopPropagation();
+            if (closestEl(e.target, '.marker-select-btn')) { selectToNextMarker(id); return; }
+            jumpToMarker(findMarker(id));
+        }, true);
+
+        document.addEventListener('dblclick', (e) => {
+            if (!closestEl(e.target, '#markers-list .marker-name')) return;
+            const id = markerIdFrom(e.target);
+            if (id) { e.preventDefault(); startMarkerRename(id); }
+        });
+
+        document.addEventListener('contextmenu', (e) => {
+            const id = markerIdFrom(e.target);
+            if (!id) { closeMarkerMenu(); return; }
+            e.preventDefault();
+            openMarkerMenu(id, e.clientX, e.clientY);
+        });
+
+        document.addEventListener('mousedown', (e) => {
+            if (!closestEl(e.target, '#marker-menu')) closeMarkerMenu();
+            // Marker lines/tags sit over the canvas and handles' neighbourhood; keep a press on them
+            // from starting a text selection or reaching the waveform underneath.
+            if (e.button === 0 && closestEl(e.target, '.waveform-marker, .waveform-marker-tag, .tx-mk')) e.preventDefault();
+        });
+        window.addEventListener('blur', closeMarkerMenu);
+        window.addEventListener('resize', () => { closeMarkerMenu(); positionMarkers(); });
+
+        // M adds, [ / ] jump. Same editable-field guard as the space bar; no modifiers.
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && document.getElementById('marker-menu')) { closeMarkerMenu(); return; }
+            if (e.ctrlKey || e.metaKey || e.altKey) return;
+            if (e.key !== 'm' && e.key !== '[' && e.key !== ']') return;
+            const el = document.activeElement;
+            const editable = el && (
+                (el.tagName === 'INPUT' && !['button', 'checkbox', 'radio', 'range'].includes(el.type)) ||
+                el.tagName === 'SELECT' ||
+                (el.tagName === 'TEXTAREA' && !el.readOnly) ||
+                el.isContentEditable
+            );
+            if (editable || !markersAvailable()) return;
+            e.preventDefault();
+            if (e.key === 'm') { if (!e.repeat) window.addMarkerAtPlayhead(); }
+            else jumpToAdjacentMarker(e.key === '[' ? -1 : 1);
+        });
+
+        renderMarkersPane();
         
         
         // ── Slice naming / export filenames ─────────────────────────────────────────
@@ -5005,6 +5599,7 @@
             // The textarea font metrics just changed; rebuild the highlight overlay so
             // its spans line up with the words (the overlay mirrors the textarea font).
             if (currentTranscription) {
+                overlaySig = '';   // force the overlay to re-read the font
                 requestAnimationFrame(() => updateTextHighlightFromTime());
             }
         };
@@ -5454,6 +6049,8 @@
                 section.style.display = '';
             })();
 
+            const _jumpBtn = document.getElementById('tx-jump-btn');
+            if (_jumpBtn) _jumpBtn.addEventListener('click', scrollHighlightToCenter);
             const _textareaResizeTarget = document.getElementById('transcription-text');
             if (_textareaResizeTarget && typeof ResizeObserver !== 'undefined') {
                 let _textareaResizeTimer;

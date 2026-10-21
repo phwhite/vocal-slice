@@ -1014,13 +1014,15 @@ h1 {
     scrollbar-gutter: stable;
     white-space: pre-wrap;
     word-wrap: break-word;
-    color: transparent;
+    /* The overlay draws every visible glyph (the textarea's own text is transparent), so it can
+       colour words individually: muted outside the waveform's zoom window. */
+    color: var(--text);
     z-index: 3;
 }
 
 .highlight-layer mark {
     background: color-mix(in srgb, var(--blue) 40%, transparent);
-    color: transparent;
+    color: inherit;
     border-radius: 3px;
     padding: 2px 0;
 }
@@ -1035,7 +1037,7 @@ h1 {
 .highlight-layer .range-body {
     background: color-mix(in srgb, color-mix(in srgb, var(--blue), var(--mauve)) 16%, transparent);
     box-shadow: inset 2px 0 0 var(--green), inset -2px 0 0 var(--red);
-    color: transparent;
+    color: inherit;
     border-radius: 3px;
     padding: 2px 0;
 }
@@ -1077,6 +1079,317 @@ textarea,
 .highlight-layer {
     scrollbar-width: thin;
     scrollbar-color: var(--overlay0) transparent;
+}
+
+/* Transcript box. The textarea only supplies layout, selection and scrolling; the overlay paints
+   the text. Both reserve the same left gutter for the paragraph time stamps and sentence numbers
+   (drawn by the overlay), so they wrap identically. */
+.textarea-wrapper {
+    --tx-gutter: 72px;
+}
+#transcription-text {
+    color: transparent;
+    padding-left: calc(16px + var(--tx-gutter));
+}
+#transcription-text::placeholder {
+    color: var(--overlay0);
+}
+.highlight-layer {
+    padding-left: calc(16px + var(--tx-gutter));
+}
+.highlight-layer .tx-dim {
+    color: color-mix(in srgb, var(--text) 38%, transparent);
+}
+/* Gutter labels sit at the start of their line but are absolutely positioned, so they add no
+   width and can't push the overlay text out of step with the textarea. */
+.highlight-layer .tx-ts,
+.highlight-layer .tx-sn {
+    position: absolute;
+    margin-top: calc((var(--tx-lh, 27px) - 14px) / 2);
+    font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+    font-size: 11px;
+    line-height: 14px;
+    letter-spacing: 0;
+    word-spacing: 0;
+    font-variant-numeric: tabular-nums;
+    color: var(--overlay0);
+    white-space: nowrap;
+    user-select: none;
+}
+.highlight-layer .tx-ts {
+    left: 14px;
+}
+.highlight-layer .tx-sn {
+    left: 50px;
+    width: 26px;
+    text-align: right;
+    opacity: 0.75;
+}
+
+/* Marker tag in the transcript: a thin blue caret in the space before the anchored word, with
+   its number on a small flag riding in the leading above the line. Zero-width and absolutely
+   positioned like the gutter labels, so it never shifts the overlay text off the textarea's. The
+   overlay ignores the pointer; the tag opts back in so it takes clicks and right-clicks. */
+.highlight-layer .tx-mk {
+    position: absolute;
+    width: 2px;
+    height: calc(var(--tx-lh, 27px) - 6px);
+    margin-top: 4px;
+    margin-left: -3px;
+    background: var(--blue);
+    border-radius: 1px;
+    pointer-events: auto;
+    cursor: pointer;
+    user-select: none;
+}
+.highlight-layer .tx-mk-pill {
+    position: absolute;
+    top: -10px;
+    min-width: 14px;
+    height: 12px;
+    padding: 0 3px;
+    border-radius: 6px;
+    background: var(--blue);
+    color: var(--crust);
+    font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 12px;
+    letter-spacing: 0;
+    word-spacing: 0;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+.highlight-layer .tx-mk:hover,
+.highlight-layer .tx-mk:hover .tx-mk-pill {
+    filter: brightness(1.12);
+}
+
+/* Transcript + Markers pane side by side; the waveform below stays full width. */
+.tx-row {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    gap: 12px;
+}
+.tx-row > .textarea-wrapper {
+    min-width: 0;
+}
+.markers-pane {
+    display: none;
+    flex: 0 0 220px;
+    width: 220px;
+    min-height: 0;
+    flex-direction: column;
+    background: var(--surface0);
+    border: 2px solid var(--surface1);
+    border-radius: 12px;
+    overflow: hidden;
+}
+.markers-pane.visible {
+    display: flex;
+}
+.markers-pane-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 12px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--subtext0);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border-bottom: 1px solid var(--surface1);
+}
+.markers-pane-header i {
+    color: var(--blue);
+    font-size: 14px;
+}
+.markers-count {
+    margin-left: auto;
+    font-variant-numeric: tabular-nums;
+    color: var(--overlay0);
+}
+.markers-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 4px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--overlay0) transparent;
+}
+.marker-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 6px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text);
+}
+.marker-row:hover {
+    background: var(--surface1);
+}
+.marker-num {
+    flex-shrink: 0;
+    min-width: 18px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 8px;
+    background: var(--blue);
+    color: var(--crust);
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 16px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+}
+.marker-time {
+    flex-shrink: 0;
+    font-size: 12px;
+    color: var(--subtext0);
+    font-variant-numeric: tabular-nums;
+}
+.marker-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.marker-name:empty::before {
+    content: 'Unnamed';
+    color: var(--overlay0);
+    font-style: italic;
+}
+.marker-name-input {
+    flex: 1;
+    min-width: 0;
+    padding: 2px 6px;
+    border: 1px solid var(--blue);
+    border-radius: 4px;
+    background: var(--base);
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+}
+.marker-name-input:focus {
+    outline: none;
+}
+.marker-select-btn {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: none;
+    border-radius: 5px;
+    background: none;
+    color: var(--overlay0);
+    font-size: 14px;
+    cursor: pointer;
+}
+.marker-select-btn:hover {
+    background: var(--surface2);
+    color: var(--blue);
+}
+.markers-pane-hint {
+    padding: 6px 12px 8px;
+    font-size: 11px;
+    color: var(--overlay0);
+    border-top: 1px solid var(--surface1);
+}
+.markers-pane-hint kbd {
+    display: inline-block;
+    min-width: 16px;
+    padding: 0 4px;
+    border: 1px solid var(--surface2);
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 10px;
+    line-height: 15px;
+    text-align: center;
+    color: var(--subtext0);
+}
+
+/* Right-click menu for markers (waveform line, transcript tag, pane row). */
+.marker-menu {
+    position: fixed;
+    z-index: 3000;
+    min-width: 190px;
+    padding: 4px;
+    background: var(--surface0);
+    border: 1px solid var(--surface2);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+    font-size: 13px;
+}
+.marker-menu-head {
+    padding: 5px 8px 6px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--overlay0);
+    font-variant-numeric: tabular-nums;
+}
+.marker-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 6px 8px;
+    border: none;
+    border-radius: 5px;
+    background: none;
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+.marker-menu-item i {
+    font-size: 15px;
+    color: var(--subtext0);
+}
+.marker-menu-item:hover,
+.marker-menu-item:focus-visible {
+    background: var(--surface1);
+    outline: none;
+}
+.marker-menu-item.danger,
+.marker-menu-item.danger i {
+    color: var(--red);
+}
+
+.tx-jump-btn {
+    position: absolute;
+    top: 10px;
+    right: 22px;
+    z-index: 5;
+    width: 30px;
+    height: 30px;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 1px solid var(--surface2, var(--surface1));
+    border-radius: 8px;
+    background: var(--surface1);
+    color: var(--subtext0);
+    font-size: 16px;
+    cursor: pointer;
+    opacity: 0.9;
+    transition: color 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
+}
+.tx-jump-btn.visible {
+    display: flex;
+}
+.tx-jump-btn:hover {
+    color: var(--blue);
+    border-color: var(--blue);
+    opacity: 1;
 }
 
 textarea:focus {
@@ -2417,6 +2730,70 @@ audio::-webkit-media-controls-volume-slider {
 
 .waveform-playhead.playing {
     opacity: 1;
+}
+
+/* Marker lines: blue, numbered tag in the ruler strip. The container passes the pointer through;
+   each line keeps a narrow hit strip for click/right-click. Below the handles (10) so a handle
+   sitting on a marker stays draggable; the tag rides above the word labels (20). */
+.waveform-markers {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+}
+.waveform-marker {
+    position: absolute;
+    top: 0;
+    width: 7px;
+    height: 100%;
+    margin-left: -3.5px;
+    z-index: 9;
+    pointer-events: auto;
+    cursor: pointer;
+}
+.waveform-marker::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 2px;
+    transform: translateX(-50%);
+    background: var(--blue);
+    /* The glow sets a marker apart from the (also blue) start ticks of in-range words. */
+    box-shadow: 0 0 6px color-mix(in srgb, var(--blue) 70%, transparent);
+}
+.waveform-marker-tag {
+    position: absolute;
+    top: 1px;
+    transform: translateX(-50%);
+    z-index: 21;
+    pointer-events: auto;
+    cursor: pointer;
+    min-width: 14px;
+    height: 13px;
+    padding: 0 3px;
+    border-radius: 4px;
+    background: var(--blue);
+    color: var(--crust);
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 13px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    user-select: none;
+}
+.waveform-marker:hover::before {
+    width: 3px;
+}
+
+#markers-pane-btn.pane-open {
+    color: var(--blue);
+}
+#markers-pane-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+    background: none;
+    color: var(--text);
 }
 
 /* Create Slice — fixed to bottom-right, vertically aligned with transport row */

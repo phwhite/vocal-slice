@@ -93,9 +93,22 @@
                     </div>
                     <!-- Transcription Editor with Highlight Overlay -->
                     <div class="form-group">
+                        <div class="tx-row">
                         <div class="textarea-wrapper">
                             <div id="highlight-layer" class="highlight-layer"></div>
                             <textarea id="transcription-text" readonly placeholder="Transcription results will appear here..."></textarea>
+                            <button type="button" id="tx-jump-btn" class="tx-jump-btn" title="Scroll to selection" aria-label="Scroll to selection"><i class="ph ph-crosshair-simple"></i></button>
+                        </div>
+                        <!-- Markers list — shown once a marker exists (and not collapsed) -->
+                        <aside id="markers-pane" class="markers-pane" aria-label="Markers">
+                            <div class="markers-pane-header">
+                                <i class="ph ph-bookmark-simple"></i>
+                                <span>Markers</span>
+                                <span id="markers-count" class="markers-count"></span>
+                            </div>
+                            <div id="markers-list" class="markers-list" role="list"></div>
+                            <div class="markers-pane-hint"><kbd>M</kbd> add · <kbd>[</kbd> <kbd>]</kbd> jump</div>
+                        </aside>
                         </div>
                     </div>
 
@@ -112,6 +125,7 @@
                                 <div id="waveform-text-layer" class="waveform-text-layer"></div>
                                 <div id="waveform-start-handle" class="waveform-handle waveform-handle-start" style="display:none;"></div>
                                 <div id="waveform-end-handle" class="waveform-handle waveform-handle-end" style="display:none;"></div>
+                                <div id="waveform-markers" class="waveform-markers"></div>
                                 <div id="waveform-playhead" class="waveform-playhead"></div>
                             </div>
                         </div>
@@ -131,6 +145,12 @@
                             </button>
                             <button class="transport-btn" id="preview-zoom-btn" onclick="zoomToSelection()" title="Zoom waveform to selection">
                                 <i class="ph ph-magnifying-glass-plus"></i>
+                            </button>
+                            <button class="transport-btn" id="preview-marker-btn" onclick="addMarkerAtPlayhead()" title="Add marker at playhead (M)">
+                                <i class="ph ph-bookmark-simple"></i>
+                            </button>
+                            <button class="transport-btn" id="markers-pane-btn" onclick="toggleMarkersPane()" title="Show markers list" disabled>
+                                <i class="ph ph-sidebar-simple"></i>
                             </button>
                             <div class="transport-divider"></div>
                             <select id="playback-speed" class="transport-select" onchange="updatePlaybackSpeed()" title="Playback speed">
