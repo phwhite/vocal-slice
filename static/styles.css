@@ -2786,6 +2786,141 @@ audio::-webkit-media-controls-volume-slider {
     width: 3px;
 }
 
+/* Slice-editor cuts: hatched regions removed from the slice. The layer passes the pointer through;
+   each cut takes clicks (right-click menu, × button, edge handles). Above the selection band (5),
+   below the selection handles (10) and the word labels (20). Starts below the ruler like the band. */
+.waveform-cuts {
+    position: absolute;
+    top: 16px;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 7;
+    pointer-events: none;
+}
+.waveform-cut {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    box-sizing: border-box;
+    border-left: 1px solid var(--red);
+    border-right: 1px solid var(--red);
+    background:
+        repeating-linear-gradient(135deg,
+            color-mix(in srgb, var(--red) 45%, transparent) 0 2px,
+            transparent 2px 7px),
+        color-mix(in srgb, var(--crust) 50%, transparent);
+    pointer-events: auto;
+    cursor: context-menu;
+}
+.waveform-cut.outside {
+    opacity: 0.4;
+}
+.waveform-cut.drafting {
+    pointer-events: none;
+    border-style: dashed;
+}
+.waveform-cut-handle {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 9px;
+    cursor: ew-resize;
+}
+.waveform-cut-handle.left  { left: -5px; }
+.waveform-cut-handle.right { right: -5px; }
+.waveform-cut-handle::before {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 4px;
+    height: 16px;
+    transform: translate(-50%, -50%);
+    border-radius: 2px;
+    background: var(--red);
+    opacity: 0;
+    transition: opacity 0.15s ease;
+}
+.waveform-cut:hover .waveform-cut-handle::before,
+.waveform-cut-handle:hover::before {
+    opacity: 1;
+}
+.waveform-cut-remove {
+    position: absolute;
+    bottom: 3px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: var(--red);
+    color: var(--crust);
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 16px;
+    text-align: center;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+}
+.waveform-cut:hover .waveform-cut-remove {
+    opacity: 1;
+}
+/* Keyboard focus shows the × too. */
+.waveform-cut-remove:focus-visible {
+    opacity: 1;
+    outline: 2px solid var(--text);
+}
+/* X pressed once: where the cut will start. */
+.waveform-cut-pending {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 0;
+    border-left: 2px dashed var(--red);
+    margin-left: -1px;
+    pointer-events: none;
+}
+/* Scissors mode: the waveform is a drag surface for a new cut. */
+.waveform-inner.cut-mode,
+.waveform-inner.cut-mode canvas {
+    cursor: crosshair !important;
+}
+/* Slice editor: word labels toggle a cut over that word. */
+#edit-waveform-text-layer .waveform-token {
+    pointer-events: auto;
+    cursor: pointer;
+}
+#edit-waveform-text-layer .waveform-token:hover {
+    color: var(--red);
+}
+#edit-waveform-text-layer .waveform-token.in-cut {
+    text-decoration: line-through;
+    text-decoration-color: var(--red);
+    color: var(--overlay1);
+}
+#edit-cut-btn.active {
+    background: var(--red);
+    color: var(--crust);
+}
+/* Slices card: this slice has regions removed. */
+.slice-cuts-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 0 6px;
+    border-radius: 9px;
+    background: color-mix(in srgb, var(--red) 18%, transparent);
+    color: var(--red);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 17px;
+    vertical-align: 1px;
+}
+
 #markers-pane-btn.pane-open {
     color: var(--blue);
 }
@@ -2979,6 +3114,15 @@ audio::-webkit-media-controls-volume-slider {
     color: var(--text);
     font-weight: 600;
     font-family: monospace;
+}
+
+/* Slice editor with cuts: how much is removed, under the net duration. */
+.time-duration .duration-cut-note {
+    display: block;
+    font-size: 11px;
+    line-height: 12px;
+    color: var(--red);
+    white-space: nowrap;
 }
 
 .match-counter {

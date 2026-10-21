@@ -676,6 +676,7 @@
                 <div id="edit-waveform-inner" class="waveform-inner">
                     <canvas id="edit-waveform-canvas"></canvas>
                     <div id="edit-waveform-selection" class="waveform-selection" style="display:none;"></div>
+                    <div id="edit-waveform-cuts" class="waveform-cuts"></div>
                     <div id="edit-waveform-text-layer" class="waveform-text-layer"></div>
                     <div id="edit-waveform-start-handle" class="waveform-handle waveform-handle-start" style="display:none;"></div>
                     <div id="edit-waveform-end-handle" class="waveform-handle waveform-handle-end" style="display:none;"></div>
@@ -697,6 +698,9 @@
                 </button>
                 <button class="transport-btn" id="edit-preview-zoom-btn" title="Zoom waveform to selection">
                     <i class="ph ph-magnifying-glass-plus"></i>
+                </button>
+                <button class="transport-btn" id="edit-cut-btn" title="Cut: drag across the waveform to remove a region">
+                    <i class="ph ph-scissors"></i>
                 </button>
                 <div class="transport-divider"></div>
                 <select id="edit-playback-speed" class="transport-select" title="Playback speed">

@@ -199,7 +199,10 @@
                         start: slice.start,
                         end: slice.end,
                         sourceAudioPath: slice.sourceAudioPath,
-                        chunks: slice.chunks || []
+                        chunks: slice.chunks || [],
+                        // Regions removed in the slice editor (absolute source seconds). The saved
+                        // file is already the kept parts joined; these let the editor reopen them.
+                        cuts: (slice.cuts || []).map(c => ({ start: c.start, end: c.end }))
                     })),
                     // Markers belong to audioFilePath; restoreSession only brings them back with it.
                     markers: markers.map(m => ({ id: m.id, time: m.time, n: m.n, name: m.name || '' })),
@@ -469,8 +472,10 @@
                                     blob: blob,
                                     filePath: savedSlice.filePath,
                                     sourceAudioPath: savedSlice.sourceAudioPath || null,
-                                    chunks: savedSlice.chunks || []
+                                    chunks: savedSlice.chunks || [],
+                                    cuts: sanitizeCuts(savedSlice.cuts, savedSlice.start, savedSlice.end)
                                 };
+                                slice.netDuration = netDuration(keptSegments(slice.start, slice.end, slice.cuts));
                                 
                                 slices.push(slice);
                                 
@@ -2470,7 +2475,10 @@
             playbackSpeed: 1.0,
             isDragging: false,
             dragHandle: null,
-            editingSliceIndex: null
+            editingSliceIndex: null,
+            // Slice editor with cuts: the kept parts play as a chain of back-to-back sources
+            // (see startChain). null on the single-range path the Transcription tab always uses.
+            chain: null
         };
 
         let _currentSelectionMatch = null;
@@ -2650,6 +2658,7 @@
 
             populateTextOverlay();
             positionMarkers();
+            positionCuts();
             // The zoom window may have changed: re-dim the transcript words outside it.
             renderOverlay();
         }
@@ -2877,6 +2886,15 @@
                     token.classList.add('in-range');
                 }
 
+                // Slice editor: a word label is a cut toggle (see the cuts section).
+                if (inModal()) {
+                    token.dataset.start = placement.startTime;
+                    token.dataset.end = placement.endTime;
+                    const inCut = cutContaining(placement.startTime, placement.endTime);
+                    if (inCut) token.classList.add('in-cut');
+                    token.title += inCut ? ' · click to restore' : ' · click to cut';
+                }
+
                 textLayer.appendChild(token);
 
                 // Start tick: a thin vertical mark at the word's exact start, connecting the ruler to
@@ -2925,6 +2943,7 @@
             updateSelectionBand();
             populateTextOverlay();
             positionMarkers();
+            positionCuts();
         }
         
         // Document/canvas drag listeners are re-created on every setupDragHandlers call; keep
@@ -3043,8 +3062,11 @@
         // Seek to a specific time within the slice
         function seekToTime(absoluteTime) {
             const wasPlaying = previewState.isPlaying;
+            // A seek into a cut lands where the cut ends: there's nothing to hear inside it.
+            absoluteTime = skipCutAt(absoluteTime);
 
             // Stop current playback without clearing pausedAt
+            stopChain();
             if (previewState.audioSource) {
                 try {
                     // Remove onended handler to prevent it from calling stopPreview
@@ -3085,7 +3107,22 @@
         function updateDurationDisplay() {
             const duration = previewState.endTime - previewState.startTime;
             const { durationEl } = getWaveformEls();
-            if (durationEl) durationEl.textContent = `${duration.toFixed(2)}s`;
+            if (!durationEl) return;
+            // Slice editor with cuts: show what will actually be saved, and how much is cut.
+            if (inModal() && editState.cuts?.length) {
+                const net = netDuration(keptSegments(previewState.startTime, previewState.endTime, editState.cuts));
+                const removed = duration - net;
+                if (removed > 0.0005) {
+                    // The cut amount gets its own small line: appended inline it wrapped mid-phrase.
+                    durationEl.textContent = `${net.toFixed(2)}s`;
+                    const note = document.createElement('span');
+                    note.className = 'duration-cut-note';
+                    note.textContent = `\u2212${removed.toFixed(2)}s cut`;
+                    durationEl.appendChild(note);
+                    return;
+                }
+            }
+            durationEl.textContent = `${duration.toFixed(2)}s`;
         }
 
         // Update preview from manual time inputs
@@ -3150,6 +3187,12 @@
         // Live bound update: a running source adopts the new selection in place, so dragging a
         // handle doesn't interrupt playback (and a loop keeps looping over the new range).
         function applyPlaybackRange() {
+            // Cuts in play (or about to be, now the range covers one): the chain's schedule is
+            // fixed once started, so rebuild it from where the playhead is (debounced for drags).
+            if (previewState.isPlaying && (previewState.chain || cutPlaybackSegments())) {
+                scheduleChainRestart();
+                return;
+            }
             const s = previewState.audioSource;
             if (!s || !previewState.isPlaying) return;
             s.loopStart = previewState.startTime;
@@ -3157,13 +3200,24 @@
             if (!previewState.isLooping) scheduleStop();
         }
 
-        window.playPreview = function() {
+        // `opts.segments` (internal): play exactly these source ranges once, from the first —
+        // "Audition the join" uses it. Otherwise the selection, minus any editor cuts.
+        window.playPreview = function(opts) {
             const oab = activeOriginalBuffer();
             if (!oab) return;
 
             // Starting Engine A stops Engine B — silence any playing slice preview.
             // (Can't use stopAllPlayback(): stopPreview would kill the preview we're starting.)
             document.querySelectorAll('#slices-list audio').forEach(a => a.pause());
+
+            // Slice editor with cuts → the kept parts, back to back. null → the one-range path.
+            const override = opts && Array.isArray(opts.segments) ? opts.segments : null;
+            const segs = override || cutPlaybackSegments();
+            if (segs && !segs.length) {
+                showToast('Everything in the selection is cut', { icon: 'ph ph-scissors' });
+                return;
+            }
+            stopChain();
 
             const audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
@@ -3173,17 +3227,23 @@
                 pos = previewState.startTime;
             }
 
-            // Play the source buffer itself (no copy) so loopStart/loopEnd stay live-assignable.
-            const source = audioContext.createBufferSource();
-            source.buffer = oab;
-            source.loop = previewState.isLooping;
-            source.loopStart = previewState.startTime;
-            source.loopEnd = previewState.endTime;
-            source.playbackRate.value = previewState.playbackSpeed;
-            source.connect(audioContext.destination);
-            source.start(0, pos);
+            if (segs) {
+                if (override) pos = segs[0].start;
+                pos = startChain(audioContext, oab, segs, pos, override ? false : previewState.isLooping);
+                previewState.audioSource = null;
+            } else {
+                // Play the source buffer itself (no copy) so loopStart/loopEnd stay live-assignable.
+                const source = audioContext.createBufferSource();
+                source.buffer = oab;
+                source.loop = previewState.isLooping;
+                source.loopStart = previewState.startTime;
+                source.loopEnd = previewState.endTime;
+                source.playbackRate.value = previewState.playbackSpeed;
+                source.connect(audioContext.destination);
+                source.start(0, pos);
 
-            previewState.audioSource = source;
+                previewState.audioSource = source;
+            }
             previewState.audioContext = audioContext;
             previewState.playPos = pos;
             previewState.lastFrameAt = audioContext.currentTime;
@@ -3191,8 +3251,8 @@
             previewState.isPlaying = true;
             previewState.isPaused = false;
 
-            if (!previewState.isLooping) {
-                source.onended = () => stopPreview();
+            if (!segs && !previewState.isLooping) {
+                previewState.audioSource.onended = () => stopPreview();
                 scheduleStop();
             }
 
@@ -3213,6 +3273,7 @@
             previewState.pausedAt = previewState.playPos;
 
             // Stop the audio
+            stopChain();
             if (previewState.audioSource) {
                 try {
                     // Remove onended handler to prevent it from calling stopPreview
@@ -3243,6 +3304,7 @@
         }
 
         window.stopPreview = function() {
+            stopChain();
             if (previewState.audioSource) {
                 try {
                     previewState.audioSource.onended = null;
@@ -3303,6 +3365,9 @@
         window.updatePlaybackSpeed = function() {
             const { speedSelect } = getWaveformEls();
             previewState.playbackSpeed = parseFloat(speedSelect.value);
+
+            // A chain's start times were computed for the old rate: rebuild it at the new one.
+            if (previewState.chain && previewState.isPlaying) { restartPlaybackFrom(previewState.playPos); return; }
 
             // If currently playing, update the playback rate
             if (previewState.audioSource && previewState.isPlaying) {
@@ -3547,7 +3612,8 @@
             // Transport keys (space, marker keys) aren't a selection change: re-deriving the
             // selection here would restart playback from the selection start and undo the
             // play/stop, jump or marker the key just made.
-            if (e.key === ' ' || e.key === 'm' || e.key === '[' || e.key === ']') return;
+            if (e.key === ' ' || e.key === 'm' || e.key === '[' || e.key === ']' ||
+                e.key === 'x' || e.key === 'X' || e.key === 'Escape') return;
             if (e.target.id === 'transcription-text') handleTranscriptionSelection(true);
         });
         document.addEventListener('mousedown', (e) => {
@@ -3571,6 +3637,7 @@
             if (e.target.closest('#edit-preview-pause-btn')) pausePreview();
             if (e.target.closest('#edit-preview-loop-btn')) toggleLoop();
             if (e.target.closest('#edit-preview-zoom-btn')) zoomToSelection();
+            if (e.target.closest('#edit-cut-btn')) toggleCutDragMode();
         });
 
         document.addEventListener('change', (e) => {
@@ -3587,13 +3654,19 @@
             // Advance an absolute position rather than inferring progress through a fixed slice —
             // the bounds can move under us mid-playback (handle drag).
             const now = previewState.audioContext.currentTime;
-            let pos = previewState.playPos + (now - previewState.lastFrameAt) * previewState.playbackSpeed;
-            previewState.lastFrameAt = now;
+            let pos;
+            if (previewState.chain) {
+                // Cuts: map context time through the chain's schedule, so the playhead jumps the gaps.
+                pos = chainPosition(previewState.chain, now);
+            } else {
+                pos = previewState.playPos + (now - previewState.lastFrameAt) * previewState.playbackSpeed;
 
-            const s = previewState.startTime, e = previewState.endTime;
-            if (previewState.isLooping && e > s && pos >= e) {
-                pos = s + ((pos - e) % (e - s));   // mirrors the source node's own loop wrap
+                const s = previewState.startTime, e = previewState.endTime;
+                if (previewState.isLooping && e > s && pos >= e) {
+                    pos = s + ((pos - e) % (e - s));   // mirrors the source node's own loop wrap
+                }
             }
+            previewState.lastFrameAt = now;
             previewState.playPos = pos;
 
             const windowDuration = previewState.windowEnd - previewState.windowStart;
@@ -3906,19 +3979,25 @@
             closeMarkerMenu();
             const m = findMarker(id);
             if (!m) return;
+            openContextMenu('Marker ' + m.n + ' · ' + formatClockTenths(m.time), [
+                ['ph ph-pencil-simple', 'Rename', () => startMarkerRename(id)],
+                ['ph ph-arrows-out-line-horizontal', 'Select to next marker', () => selectToNextMarker(id)],
+                ['ph ph-trash', 'Delete', () => { closeMarkerMenu(); deleteMarker(id); }, 'danger'],
+            ], x, y);
+        }
+
+        // The one in-app context menu (markers, editor cuts). `items`: [icon, label, fn, cls?].
+        // Always #marker-menu, so the shared close-on-outside-press / Escape / blur handlers cover it.
+        function openContextMenu(headText, items, x, y) {
+            closeMarkerMenu();
             const menu = document.createElement('div');
             menu.id = 'marker-menu';
             menu.className = 'marker-menu';
             menu.setAttribute('role', 'menu');
             const head = document.createElement('div');
             head.className = 'marker-menu-head';
-            head.textContent = 'Marker ' + m.n + ' · ' + formatClockTenths(m.time);
+            head.textContent = headText;
             menu.appendChild(head);
-            const items = [
-                ['ph ph-pencil-simple', 'Rename', () => startMarkerRename(id)],
-                ['ph ph-arrows-out-line-horizontal', 'Select to next marker', () => selectToNextMarker(id)],
-                ['ph ph-trash', 'Delete', () => { closeMarkerMenu(); deleteMarker(id); }, 'danger'],
-            ];
             for (const [icon, label, fn, cls] of items) {
                 const b = document.createElement('button');
                 b.type = 'button';
@@ -3973,7 +4052,7 @@
             if (e.button === 0 && closestEl(e.target, '.waveform-marker, .waveform-marker-tag, .tx-mk')) e.preventDefault();
         });
         window.addEventListener('blur', closeMarkerMenu);
-        window.addEventListener('resize', () => { closeMarkerMenu(); positionMarkers(); });
+        window.addEventListener('resize', () => { closeMarkerMenu(); positionMarkers(); positionCuts(); });
 
         // M adds, [ / ] jump. Same editable-field guard as the space bar; no modifiers.
         document.addEventListener('keydown', (e) => {
@@ -3996,6 +4075,468 @@
         renderMarkersPane();
         
         
+
+        // ── Cuts (slice editor only) ───────────────────────────────────────────────────────────
+        // A cut removes a region from inside a slice: editState.cuts = [{start, end}] in absolute
+        // source seconds, sorted and non-overlapping. Playback skips them, the saved file is the
+        // kept parts joined (edges snapped to zero crossings so the joins don't click), and the
+        // slice keeps its cuts so reopening the editor brings them back. The Transcription tab
+        // never has cuts — every path below is gated on inModal().
+        const CUT_MIN = 0.02;          // seconds; shorter cuts are ignored
+        const CUT_SNAP_WINDOW = 0.005; // seconds either side searched for a zero crossing
+        const CUT_AUDITION_PAD = 0.5;  // seconds either side of a cut "Audition the join" plays
+
+        // Kept ranges of [start, end] after removing `cuts` (clipped to the bounds; a cut wholly
+        // outside them removes nothing). Pure.
+        function keptSegments(start, end, cuts) {
+            const segs = [];
+            let t = start;
+            const sorted = (cuts || []).slice().sort((a, b) => a.start - b.start);
+            for (const c of sorted) {
+                const cs = Math.max(start, c.start), ce = Math.min(end, c.end);
+                if (ce <= cs) continue;
+                if (cs > t) segs.push({ start: t, end: cs });
+                t = Math.max(t, ce);
+            }
+            if (end > t) segs.push({ start: t, end });
+            return segs.filter(s => s.end - s.start > 1e-6);
+        }
+        function netDuration(segments) {
+            return (segments || []).reduce((a, s) => a + (s.end - s.start), 0);
+        }
+        // A slice's playable length: its range, less any cuts.
+        function sliceDurationSec(slice) {
+            if (!slice.cuts?.length) return (slice.endTime - slice.startTime) / 1000;
+            return slice.netDuration ?? netDuration(keptSegments(slice.start, slice.end, slice.cuts));
+        }
+
+        // Sort and merge overlapping/touching cuts; drop degenerate ones.
+        function normalizeCuts(cuts) {
+            const sorted = (cuts || []).filter(c => c && c.end - c.start > 1e-6)
+                .map(c => ({ start: c.start, end: c.end })).sort((a, b) => a.start - b.start);
+            const out = [];
+            for (const c of sorted) {
+                const last = out[out.length - 1];
+                if (last && c.start <= last.end + 1e-4) last.end = Math.max(last.end, c.end);
+                else out.push(c);
+            }
+            return out;
+        }
+        // Cuts clipped to [start, end]; those wholly outside are dropped (what a save keeps).
+        function clipCuts(cuts, start, end) {
+            return normalizeCuts((cuts || []).map(c => ({ start: Math.max(start, c.start), end: Math.min(end, c.end) })))
+                .filter(c => c.end - c.start >= 1e-4);
+        }
+        // Session data is untrusted input: keep only finite, ordered ranges inside the slice.
+        function sanitizeCuts(raw, start, end) {
+            if (!Array.isArray(raw) || !Number.isFinite(start) || !Number.isFinite(end)) return [];
+            return clipCuts(raw.filter(c => c && Number.isFinite(c.start) && Number.isFinite(c.end) && c.end > c.start), start, end);
+        }
+
+        // Nearest zero crossing of channel 0 within ±CUT_SNAP_WINDOW of t, else t unchanged.
+        function snapToZeroCrossing(buffer, t) {
+            if (!buffer || !Number.isFinite(t)) return t;
+            const sr = buffer.sampleRate;
+            const d = buffer.getChannelData(0);
+            const centre = Math.round(t * sr);
+            const span = Math.round(CUT_SNAP_WINDOW * sr);
+            const crosses = (i) => i > 0 && i < d.length &&
+                (d[i] === 0 || (d[i - 1] < 0) !== (d[i] < 0));
+            for (let k = 0; k <= span; k++) {
+                if (crosses(centre - k)) return (centre - k) / sr;
+                if (k && crosses(centre + k)) return (centre + k) / sr;
+            }
+            return t;
+        }
+
+        const editCuts = () => (inModal() && Array.isArray(editState.cuts)) ? editState.cuts : [];
+
+        // A cut that wholly contains [a, b] (a word's span), or null. The tolerance covers the
+        // zero-crossing snap, which can pull a word cut's edges up to CUT_SNAP_WINDOW inside it.
+        function cutContaining(a, b) {
+            const eps = CUT_SNAP_WINDOW + 1e-3;
+            return editCuts().find(c => c.start <= a + eps && c.end >= b - eps) || null;
+        }
+
+        // A time inside a cut (within the handles) moves to that cut's end.
+        function skipCutAt(t) {
+            if (!inModal() || t == null) return t;
+            for (const c of editCuts()) {
+                if (t >= c.start && t < c.end && c.end > previewState.startTime && c.start < previewState.endTime) {
+                    return Math.min(c.end, previewState.endTime);
+                }
+            }
+            return t;
+        }
+
+        // What the preview engine should play: null → the one-range path (always on the
+        // Transcription tab, and in the editor when no cut touches the selection); otherwise the
+        // kept segments (possibly empty, when everything is cut).
+        function cutPlaybackSegments() {
+            if (!inModal()) return null;
+            const cuts = editCuts();
+            if (!cuts.length) return null;
+            const { startTime: s, endTime: e } = previewState;
+            const segs = keptSegments(s, e, cuts);
+            if (segs.length === 1 && Math.abs(segs[0].start - s) < 1e-9 && Math.abs(segs[0].end - e) < 1e-9) return null;
+            return segs;
+        }
+
+        // ── Chain playback: one BufferSource per kept segment, sample-accurate back to back ──
+        // Returns the source position actually started from (a position inside a cut, or past the
+        // last segment, moves to the next kept segment / wraps to the first).
+        function startChain(ctx, buffer, segs, pos, loop) {
+            const chain = { ctx, buffer, segs, loop, speed: previewState.playbackSpeed,
+                            sources: [], table: [], timer: null, restartTimer: null, endsAt: 0 };
+            previewState.chain = chain;
+            return scheduleChain(chain, pos, ctx.currentTime);
+        }
+
+        function scheduleChain(chain, pos, when) {
+            const { ctx, buffer, segs, speed } = chain;
+            let i = segs.findIndex(s => pos < s.end - 1e-6);
+            if (i < 0) { i = 0; pos = segs[0].start; }
+            if (pos < segs[i].start) pos = segs[i].start;
+            const startedAt = pos;
+            let t = when, last = null;
+            for (let k = i; k < segs.length; k++) {
+                const off = k === i ? pos : segs[k].start;
+                const dur = segs[k].end - off;          // buffer seconds (start()'s duration is in buffer time)
+                if (dur <= 1e-6) continue;
+                const src = ctx.createBufferSource();
+                src.buffer = buffer;
+                src.playbackRate.value = speed;
+                src.connect(ctx.destination);
+                src.start(t, off, dur);
+                src.onended = () => { const j = chain.sources.indexOf(src); if (j >= 0) chain.sources.splice(j, 1); };
+                chain.sources.push(src);
+                chain.table.push({ ctxStart: t, ctxEnd: t + dur / speed, srcStart: off, srcEnd: off + dur, speed });
+                t += dur / speed;
+                last = src;
+            }
+            chain.endsAt = t;
+            if (chain.loop) {
+                // Queue the next pass shortly before this one ends, starting exactly where it ends.
+                const lead = Math.max(0, (t - ctx.currentTime - 0.25) * 1000);
+                chain.timer = setTimeout(() => {
+                    if (previewState.chain !== chain) return;
+                    const now = ctx.currentTime;
+                    chain.table = chain.table.filter(e => e.ctxEnd >= now - 0.05);
+                    scheduleChain(chain, segs[0].start, Math.max(chain.endsAt, now));
+                }, lead);
+            } else if (last) {
+                last.onended = () => { if (previewState.chain === chain) stopPreview(); };
+            }
+            return startedAt;
+        }
+
+        // Source position at context time `now`, from the chain's schedule.
+        function chainPosition(chain, now) {
+            const tb = chain.table;
+            while (tb.length > 1 && tb[0].ctxEnd <= now) tb.shift();
+            const e = tb[0];
+            if (!e) return previewState.playPos;
+            if (now <= e.ctxStart) return e.srcStart;
+            if (now >= e.ctxEnd) return e.srcEnd;
+            return e.srcStart + (now - e.ctxStart) * e.speed;
+        }
+
+        // Silence and forget the chain (no-op without one). Callers handle the context.
+        function stopChain() {
+            const chain = previewState.chain;
+            if (!chain) return;
+            previewState.chain = null;
+            clearTimeout(chain.timer);
+            clearTimeout(chain.restartTimer);
+            for (const s of chain.sources) {
+                s.onended = null;
+                try { s.stop(); } catch (e) { /* already stopped */ }
+            }
+            chain.sources = [];
+        }
+
+        // Re-cut playback from a source position with the current cuts/range/rate.
+        function restartPlaybackFrom(pos) {
+            if (!previewState.isPlaying) return;
+            stopPreview();
+            previewState.pausedAt = pos;
+            playPreview();
+        }
+        let _chainRestartTimer = null;
+        function scheduleChainRestart() {
+            clearTimeout(_chainRestartTimer);
+            _chainRestartTimer = setTimeout(() => {
+                _chainRestartTimer = null;
+                if (previewState.isPlaying) restartPlaybackFrom(previewState.playPos);
+            }, 120);
+        }
+
+        // ── Editing ──
+        function cutsChanged() {
+            positionCuts();
+            populateTextOverlay();
+            updateDurationDisplay();
+            if (previewState.isPlaying) restartPlaybackFrom(previewState.playPos);
+        }
+
+        // Add a cut over [a, b] (either order), snapped to zero crossings, clipped to the handles,
+        // merged with any cut it overlaps. Returns true if a cut was made.
+        function addCut(a, b) {
+            if (!inModal() || !Number.isFinite(a) || !Number.isFinite(b)) return false;
+            const buf = activeOriginalBuffer();
+            let s = snapToZeroCrossing(buf, Math.min(a, b));
+            let e = snapToZeroCrossing(buf, Math.max(a, b));
+            s = Math.max(s, previewState.startTime);
+            e = Math.min(e, previewState.endTime);
+            if (e - s < CUT_MIN) return false;
+            editState.cuts = normalizeCuts([...editCuts(), { start: s, end: e }]);
+            cutsChanged();
+            return true;
+        }
+        window.addCut = addCut;   // also the test hook for the harness
+
+        function removeCut(i) {
+            if (!inModal() || !editState.cuts?.[i]) return;
+            editState.cuts.splice(i, 1);
+            closeMarkerMenu();
+            cutsChanged();
+        }
+
+        // Play 0.5 s either side of a cut, joined — what the edit will sound like at that point.
+        function auditionCut(i) {
+            const c = editCuts()[i];
+            const buf = activeOriginalBuffer();
+            if (!c || !buf) return;
+            const segs = [
+                { start: Math.max(0, c.start - CUT_AUDITION_PAD), end: c.start },
+                { start: c.end, end: Math.min(buf.duration, c.end + CUT_AUDITION_PAD) },
+            ].filter(s => s.end - s.start > 0.001);
+            if (!segs.length) return;
+            stopPreview();
+            playPreview({ segments: segs });
+        }
+
+        // Where X records a cut edge: the live playhead, else the pause/seek point, else the cue,
+        // else the selection start.
+        function cutCursorTime() {
+            const p = previewState;
+            if (p.isPlaying && p.playPos != null) return p.playPos;
+            if (p.pausedAt != null) return p.pausedAt;
+            if (p.cueTime != null) return p.cueTime;
+            return p.startTime;
+        }
+
+        function clearPendingCut() {
+            if (!editState || editState.pendingCut == null) return false;
+            editState.pendingCut = null;
+            positionCuts();
+            return true;
+        }
+
+        function handleCutKey() {
+            const t = cutCursorTime();
+            if (editState.pendingCut == null) {
+                editState.pendingCut = t;
+                positionCuts();
+                showToast(`Cut from ${formatClockTenths(t)} — press X again to end`, { icon: 'ph ph-scissors' });
+                return;
+            }
+            const a = editState.pendingCut;
+            if (Math.abs(t - a) < CUT_MIN) return;   // too short: keep waiting for the end
+            editState.pendingCut = null;
+            if (!addCut(a, t)) positionCuts();
+        }
+
+        // ── Scissors button: drag across the waveform to cut ──
+        let cutDragMode = false;
+        let cutDraft = null;            // { a, b } while dragging out a new cut
+        let cutEdgeDrag = null;         // { index, edge } while dragging a cut's edge
+        let suppressCutClick = false;   // swallow the click that ends a cut drag
+
+        function setCutDragMode(on) {
+            cutDragMode = !!on && inModal();
+            const btn = document.getElementById('edit-cut-btn');
+            if (btn) btn.classList.toggle('active', cutDragMode);
+            document.getElementById('edit-waveform-inner')?.classList.toggle('cut-mode', cutDragMode);
+        }
+        function toggleCutDragMode() { setCutDragMode(!cutDragMode); }
+
+        // Client x → source time inside the current window.
+        function editTimeAtClientX(clientX) {
+            const canvas = document.getElementById('edit-waveform-canvas');
+            const rect = canvas.getBoundingClientRect();
+            const width = canvas.clientWidth;
+            const ws = previewState.windowStart, we = previewState.windowEnd;
+            const t = ws + ((clientX - rect.left) / width) * (we - ws);
+            return Math.max(ws, Math.min(we, t));
+        }
+
+        // ── Drawing ── hatched regions, window-relative like the handles; hidden off-window.
+        function positionCuts() {
+            const layer = document.getElementById('edit-waveform-cuts');
+            if (!layer) return;
+            const canvas = document.getElementById('edit-waveform-canvas');
+            const ws = previewState.windowStart, we = previewState.windowEnd;
+            const width = canvas ? canvas.clientWidth : 0;
+            if (!inModal() || !width || we <= ws) { layer.innerHTML = ''; return; }
+            const x = (t) => ((t - ws) / (we - ws)) * width;
+            let html = '';
+            editCuts().forEach((c, i) => {
+                if (c.end < ws || c.start > we) return;
+                const outside = c.end <= previewState.startTime || c.start >= previewState.endTime;
+                const x1 = x(Math.max(ws, c.start)), x2 = x(Math.min(we, c.end));
+                const title = `Cut ${formatClockTenths(c.start)}–${formatClockTenths(c.end)} (${(c.end - c.start).toFixed(2)}s)` +
+                    (outside ? ' · outside the selection, not applied' : '') + ' · right-click for options';
+                html += `<div class="waveform-cut${outside ? ' outside' : ''}" data-cut-index="${i}" ` +
+                    `style="left:${x1.toFixed(1)}px;width:${Math.max(1, x2 - x1).toFixed(1)}px" title="${title}">` +
+                    (c.start >= ws ? `<span class="waveform-cut-handle left" data-cut-index="${i}" data-edge="start"></span>` : '') +
+                    (c.end <= we ? `<span class="waveform-cut-handle right" data-cut-index="${i}" data-edge="end"></span>` : '') +
+                    `<button type="button" class="waveform-cut-remove" data-cut-index="${i}" title="Remove cut" aria-label="Remove cut">×</button>` +
+                    `</div>`;
+            });
+            if (cutDraft) {
+                const a = Math.min(cutDraft.a, cutDraft.b), b = Math.max(cutDraft.a, cutDraft.b);
+                html += `<div class="waveform-cut drafting" style="left:${x(a).toFixed(1)}px;width:${Math.max(1, x(b) - x(a)).toFixed(1)}px"></div>`;
+            }
+            const pend = editState.pendingCut;
+            if (pend != null && pend >= ws && pend <= we) {
+                html += `<div class="waveform-cut-pending" style="left:${x(pend).toFixed(1)}px" title="Cut starts here — press X again to end"></div>`;
+            }
+            layer.innerHTML = html;
+        }
+
+        // ── Input ──
+        const cutIndexFrom = (target) => {
+            const el = closestEl(target, '#edit-waveform-cuts [data-cut-index]');
+            return el ? Number(el.dataset.cutIndex) : null;
+        };
+
+        document.addEventListener('mousedown', (e) => {
+            if (e.button !== 0 || !inModal()) return;
+            const handle = closestEl(e.target, '#edit-waveform-cuts .waveform-cut-handle');
+            if (handle) {
+                e.preventDefault();
+                e.stopPropagation();
+                cutEdgeDrag = { index: Number(handle.dataset.cutIndex), edge: handle.dataset.edge };
+                return;
+            }
+            if (closestEl(e.target, '.waveform-cut-remove')) { e.preventDefault(); return; }
+            // Scissors mode: a press anywhere on the waveform (not a handle) starts a new cut.
+            if (cutDragMode && closestEl(e.target, '#edit-waveform-inner') &&
+                !closestEl(e.target, '.waveform-handle')) {
+                e.preventDefault();
+                e.stopPropagation();
+                const t = editTimeAtClientX(e.clientX);
+                cutDraft = { a: t, b: t, x0: e.clientX };
+                positionCuts();
+            }
+        }, true);
+
+        document.addEventListener('mousemove', (e) => {
+            if (cutDraft) {
+                cutDraft.b = editTimeAtClientX(e.clientX);
+                positionCuts();
+                return;
+            }
+            if (!cutEdgeDrag || !inModal()) return;
+            const cuts = editState.cuts;
+            const c = cuts[cutEdgeDrag.index];
+            if (!c) { cutEdgeDrag = null; return; }
+            const t = snapToZeroCrossing(activeOriginalBuffer(), editTimeAtClientX(e.clientX));
+            // Edges can't cross each other or leave the selection; they may reach a neighbour
+            // (and merge with it on release).
+            if (cutEdgeDrag.edge === 'start') {
+                const lo = Math.max(previewState.startTime, cuts[cutEdgeDrag.index - 1]?.end ?? -Infinity);
+                c.start = Math.max(lo, Math.min(t, c.end - CUT_MIN));
+            } else {
+                const hi = Math.min(previewState.endTime, cuts[cutEdgeDrag.index + 1]?.start ?? Infinity);
+                c.end = Math.min(hi, Math.max(t, c.start + CUT_MIN));
+            }
+            positionCuts();
+            updateDurationDisplay();
+        });
+
+        document.addEventListener('mouseup', (e) => {
+            if (cutDraft) {
+                const { a, b, x0 } = cutDraft;
+                cutDraft = null;
+                suppressCutClick = true;
+                setTimeout(() => { suppressCutClick = false; }, 0);
+                setCutDragMode(false);
+                if (Math.abs(e.clientX - x0) < 3 || !addCut(a, b)) positionCuts();
+                return;
+            }
+            if (cutEdgeDrag) {
+                cutEdgeDrag = null;
+                suppressCutClick = true;
+                setTimeout(() => { suppressCutClick = false; }, 0);
+                if (inModal()) { editState.cuts = normalizeCuts(editState.cuts); cutsChanged(); }
+            }
+        });
+
+        // Capture phase: these clicks must not also reach the canvas (click-to-seek) underneath.
+        document.addEventListener('click', (e) => {
+            if (suppressCutClick) {
+                suppressCutClick = false;
+                if (closestEl(e.target, '#edit-waveform-inner')) { e.preventDefault(); e.stopPropagation(); }
+                return;
+            }
+            if (!inModal()) return;
+            const rm = closestEl(e.target, '#edit-waveform-cuts .waveform-cut-remove');
+            if (rm) { e.preventDefault(); e.stopPropagation(); removeCut(Number(rm.dataset.cutIndex)); return; }
+            // A word label toggles a cut over that word. The selection handles stay put.
+            const tok = closestEl(e.target, '#edit-waveform-text-layer .waveform-token');
+            if (tok && tok.dataset.start != null) {
+                e.preventDefault();
+                e.stopPropagation();
+                const a = parseFloat(tok.dataset.start), b = parseFloat(tok.dataset.end);
+                const existing = cutContaining(a, b);
+                if (existing) removeCut(editState.cuts.indexOf(existing));
+                else if (!addCut(a, b)) showToast('That word is outside the selection', { icon: 'ph ph-scissors' });
+                return;
+            }
+            // A press on a cut's body is not a seek into removed audio.
+            if (closestEl(e.target, '#edit-waveform-cuts .waveform-cut')) { e.preventDefault(); e.stopPropagation(); }
+        }, true);
+
+        // Registered after the marker menu's handler, which closes any menu on a non-marker target.
+        document.addEventListener('contextmenu', (e) => {
+            if (!inModal()) return;
+            const i = cutIndexFrom(e.target);
+            if (i == null || !editState.cuts[i]) return;
+            e.preventDefault();
+            const c = editState.cuts[i];
+            openContextMenu(`Cut · ${formatClockTenths(c.start)}–${formatClockTenths(c.end)} (${(c.end - c.start).toFixed(2)}s)`, [
+                ['ph ph-ear', 'Audition the join', () => auditionCut(i)],
+                ['ph ph-trash', 'Remove cut', () => removeCut(i), 'danger'],
+            ], e.clientX, e.clientY);
+        });
+
+        // X marks a cut's start, then its end. Escape drops a pending start / leaves scissors mode.
+        document.addEventListener('keydown', (e) => {
+            if (!inModal()) return;
+            if (e.key === 'Escape') {
+                if (document.getElementById('marker-menu')) return;   // the menu's own Escape
+                const had = clearPendingCut();
+                if (cutDragMode) { setCutDragMode(false); cutDraft = null; positionCuts(); }
+                else if (!had) return;
+                e.preventDefault();
+                return;
+            }
+            if (e.key !== 'x' && e.key !== 'X') return;
+            if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+            const el = document.activeElement;
+            const editable = el && (
+                (el.tagName === 'INPUT' && !['button', 'checkbox', 'radio', 'range'].includes(el.type)) ||
+                el.tagName === 'SELECT' ||
+                (el.tagName === 'TEXTAREA' && !el.readOnly) ||
+                el.isContentEditable
+            );
+            if (editable || !activeOriginalBuffer()) return;
+            e.preventDefault();
+            handleCutKey();
+        });
+
         // ── Slice naming / export filenames ─────────────────────────────────────────
         const DEFAULT_FILENAME_TEMPLATE = '{source}_{index}_{slug}';
 
@@ -4133,9 +4674,13 @@
         }
 
         // Shared audio extraction + save logic used by createSlice and updateSlice
-        async function buildSliceEntry(startTime, endTime, text, name) {
+        // `cuts` (slice editor): regions to leave out; the file is the kept parts joined.
+        async function buildSliceEntry(startTime, endTime, text, name, cuts = []) {
+            const keptCuts = clipCuts(cuts, startTime, endTime);
+            const segments = keptSegments(startTime, endTime, keptCuts);
+            if (!segments.length) throw new Error('Every part of this slice is cut — nothing to save');
             addLog(`🎵 Exporting slice at source quality...`);
-            const blob = await exportSourceQualitySlice(startTime, endTime);
+            const blob = await exportSourceQualitySlice(segments);
             if (!blob || blob.size <= 44) throw new Error('Failed to extract audio slice');
             addLog(`✅ WAV created: ${(blob.size / 1024).toFixed(1)}KB`);
             const url = URL.createObjectURL(blob);
@@ -4151,21 +4696,44 @@
                 }
             }
 
-            const sliceDuration = endTime - startTime;
             const _tr = activeTranscription();
-            const chunks = (_tr?.chunks || _tr?.allTokens || [])
-                .filter(c => c.timestamp && (c.timestamp[1] ?? c.timestamp[0]) > startTime && c.timestamp[0] < endTime)
-                .map(c => ({
-                    text: c.text,
-                    timestamp: [
-                        Math.max(0, c.timestamp[0] - startTime),
-                        Math.min(sliceDuration, (c.timestamp[1] ?? c.timestamp[0]) - startTime)
-                    ]
-                }));
+            const chunks = remapChunksToSegments(_tr?.chunks || _tr?.allTokens || [], segments);
 
             return { text, name: name || slugify(text), startTime: startTime * 1000, endTime: endTime * 1000,
                      start: startTime, end: endTime, url, blob, filePath,
-                     sourceAudioPath: activeFile()?.path || null, chunks };
+                     sourceAudioPath: activeFile()?.path || null, chunks,
+                     cuts: keptCuts, netDuration: netDuration(segments) };
+        }
+
+        // Word timings relative to the exported file: words inside a cut are dropped, later words
+        // shift left by the cut time before them, and a word straddling a cut edge is clipped to
+        // its kept part — unless less than half of it survives, which is a cut word plus the
+        // sliver the zero-crossing snap left. With one segment (no cuts) this is exactly the old
+        // [start, end] clip-and-offset.
+        function remapChunksToSegments(chunks, segments) {
+            const out = [];
+            for (const c of chunks) {
+                if (!c.timestamp) continue;
+                const a = c.timestamp[0];
+                const b = c.timestamp[1] ?? c.timestamp[0];
+                let first = null, last = null, base = 0, kept = 0, inGap = false;
+                segments.forEach((s, i) => {
+                    const os = Math.max(a, s.start), oe = Math.min(b, s.end);
+                    const hit = b > a ? oe > os : (a > s.start && a < s.end);
+                    if (hit) {
+                        if (first === null) first = base + (os - s.start);
+                        last = base + (Math.max(os, oe) - s.start);
+                        kept += Math.max(0, oe - os);
+                    }
+                    const next = segments[i + 1];
+                    if (next && b > s.end && a < next.start) inGap = true;   // overlaps the cut after s
+                    base += s.end - s.start;
+                });
+                if (first === null) continue;
+                if (inGap && b > a && kept < (b - a) / 2) continue;
+                out.push({ text: c.text, timestamp: [first, last] });
+            }
+            return out;
         }
 
         // Transient toast notification. `onClick` (optional) makes the whole toast clickable.
@@ -4302,7 +4870,9 @@
                 // Keep a manually-renamed name; let auto-named slices follow the new selection's text.
                 const old = (!saveAsNew && editingSliceIndex !== null) ? slices[editingSliceIndex] : null;
                 const keepName = (old && old.name && old.name !== slugify(old.text)) ? old.name : undefined;
-                const entry = await buildSliceEntry(startTime, endTime, selectedText, keepName);
+                // The editor's cuts, clipped to the final handles (a cut dragged outside is dropped).
+                const cuts = inModal() ? clipCuts(editState.cuts, startTime, endTime) : [];
+                const entry = await buildSliceEntry(startTime, endTime, selectedText, keepName, cuts);
 
                 if (!saveAsNew && editingSliceIndex !== null) {
                     if (slices[editingSliceIndex].url) URL.revokeObjectURL(slices[editingSliceIndex].url);
@@ -4384,6 +4954,9 @@
 
             previewState.editingSliceIndex = sliceIndex;
             previewState.selectedText = slice.text;
+            // Working copy of the slice's cuts: Cancel discards it, Update / Save as new keep it.
+            editState.cuts = normalizeCuts(slice.cuts || []);
+            editState.pendingCut = null;
 
             mountSliceEditor(sliceIndex);
 
@@ -4414,6 +4987,11 @@
 
         function closeSliceEditor() {
             stopAllPlayback(); // leaving edit mode silences everything, not just Engine A
+            setCutDragMode(false);
+            cutDraft = null;
+            cutEdgeDrag = null;
+            const cutsLayer = document.getElementById('edit-waveform-cuts');
+            if (cutsLayer) cutsLayer.innerHTML = '';
             waveformContext = 'transcription';
             const editedIndex = previewState.editingSliceIndex;
             // Return the editor panel to its hidden holder (never destroyed by list rebuilds).
@@ -4613,16 +5191,18 @@
             return { ...fmt, chunks, dataChunk };
         }
 
-        // Rebuild a WAV containing only the [startTime,endTime] range, copying every chunk
-        // verbatim except `data` (replaced by the sliced bytes) → byte-identical quality.
-        function sliceWavLossless(ab, parsed, startTime, endTime) {
+        // Rebuild a WAV containing only the given [{start,end}] ranges (joined, in order), copying
+        // every chunk verbatim except `data` (replaced by the sliced bytes) → byte-identical quality.
+        function sliceWavLossless(ab, parsed, segments) {
             const { sampleRate, blockAlign, dataChunk, chunks } = parsed;
-            let startByte = Math.round(startTime * sampleRate) * blockAlign;
-            let endByte = Math.round(endTime * sampleRate) * blockAlign;
-            startByte = Math.max(0, Math.min(startByte, dataChunk.size));
-            endByte = Math.max(startByte, Math.min(endByte, dataChunk.size));
-            const sliceLen = endByte - startByte;
-            const sliceBytes = new Uint8Array(ab, dataChunk.bodyOffset + startByte, sliceLen);
+            const ranges = segments.map(({ start, end }) => {
+                let startByte = Math.round(start * sampleRate) * blockAlign;
+                let endByte = Math.round(end * sampleRate) * blockAlign;
+                startByte = Math.max(0, Math.min(startByte, dataChunk.size));
+                endByte = Math.max(startByte, Math.min(endByte, dataChunk.size));
+                return [startByte, endByte];
+            });
+            const sliceLen = ranges.reduce((a, [s, e]) => a + (e - s), 0);
 
             let bodyTotal = 4; // 'WAVE'
             for (const c of chunks) {
@@ -4638,7 +5218,11 @@
                 writeTag(o, c.id);
                 if (c.id === 'data') {
                     odv.setUint32(o + 4, sliceLen, true);
-                    out.set(sliceBytes, o + 8);
+                    let w = o + 8;
+                    for (const [s, e] of ranges) {
+                        out.set(new Uint8Array(ab, dataChunk.bodyOffset + s, e - s), w);
+                        w += e - s;
+                    }
                     o += 8 + sliceLen + (sliceLen & 1);
                 } else {
                     odv.setUint32(o + 4, c.size, true);
@@ -4649,13 +5233,17 @@
             return new Blob([out], { type: 'audio/wav' });
         }
 
-        // Re-encode a time range of a decoded AudioBuffer to interleaved PCM WAV (default 24-bit).
-        function audioBufferRangeToWav(buffer, startTime, endTime, bitDepth = 24) {
+        // Re-encode [{start,end}] ranges of a decoded AudioBuffer, joined, to interleaved PCM WAV
+        // (default 24-bit).
+        function audioBufferRangeToWav(buffer, segments, bitDepth = 24) {
             const sampleRate = buffer.sampleRate;
             const numChannels = buffer.numberOfChannels;
-            const startSample = Math.max(0, Math.floor(startTime * sampleRate));
-            const endSample = Math.min(buffer.length, Math.ceil(endTime * sampleRate));
-            const frames = Math.max(0, endSample - startSample);
+            const sampleRanges = segments.map(({ start, end }) => {
+                const startSample = Math.max(0, Math.floor(start * sampleRate));
+                const endSample = Math.min(buffer.length, Math.ceil(end * sampleRate));
+                return [startSample, Math.max(startSample, endSample)];
+            });
+            const frames = sampleRanges.reduce((a, [s, e]) => a + (e - s), 0);
             const bytesPerSample = bitDepth / 8;
             const blockAlign = numChannels * bytesPerSample;
             const byteRate = sampleRate * blockAlign;
@@ -4683,6 +5271,7 @@
             const posMax = Math.pow(2, bitDepth - 1) - 1;
             const negMax = Math.pow(2, bitDepth - 1);
             let offset = 44;
+            for (const [startSample, endSample] of sampleRanges)
             for (let i = startSample; i < endSample; i++) {
                 for (let c = 0; c < numChannels; c++) {
                     let s = Math.max(-1, Math.min(1, chans[c][i]));
@@ -4700,18 +5289,18 @@
             return new Blob([out], { type: 'audio/wav' });
         }
 
-        // Produce a source-quality WAV blob for the [startTime,endTime] range of the active file:
+        // Produce a source-quality WAV blob of the active file's [{start,end}] segments, joined:
         // byte-exact for uncompressed WAV, otherwise re-encoded from the decoded buffer.
-        async function exportSourceQualitySlice(startTime, endTime) {
+        async function exportSourceQualitySlice(segments) {
             const bytes = await readSourceBytes(activeFile());
             const parsed = bytes && parseWavChunks(bytes);
             // Byte-copy is only valid for constant-block-align formats (PCM/float/extensible).
             if (parsed && [1, 3, 0xFFFE].includes(parsed.audioFormat)) {
-                return sliceWavLossless(bytes, parsed, startTime, endTime);
+                return sliceWavLossless(bytes, parsed, segments);
             }
             const buf = activeOriginalBuffer();
             if (!buf) throw new Error('No source audio available for export');
-            return audioBufferRangeToWav(buf, startTime, endTime, 24);
+            return audioBufferRangeToWav(buf, segments, 24);
         }
         
         function populateSliceTextOverlay(textLayer, chunks, duration, canvasWidth) {
@@ -4820,10 +5409,10 @@
                     sortedEntries.sort((a, b) => b.slice.text.localeCompare(a.slice.text));
                     break;
                 case 'duration-asc':
-                    sortedEntries.sort((a, b) => (a.slice.endTime - a.slice.startTime) - (b.slice.endTime - b.slice.startTime));
+                    sortedEntries.sort((a, b) => sliceDurationSec(a.slice) - sliceDurationSec(b.slice));
                     break;
                 case 'duration-desc':
-                    sortedEntries.sort((a, b) => (b.slice.endTime - b.slice.startTime) - (a.slice.endTime - a.slice.startTime));
+                    sortedEntries.sort((a, b) => sliceDurationSec(b.slice) - sliceDurationSec(a.slice));
                     break;
                 case 'newest':
                 default:
@@ -4894,6 +5483,17 @@
                 const time = document.createElement('div');
                 time.className = 'slice-time';
                 time.textContent = `Time: ${(slice.startTime/1000).toFixed(2)}s - ${(slice.endTime/1000).toFixed(2)}s`;
+                // Edited in the slice editor: the file is shorter than its range — say so.
+                if (slice.cuts?.length) {
+                    const n = slice.cuts.length;
+                    time.appendChild(document.createTextNode(` (${sliceDurationSec(slice).toFixed(2)}s) `));
+                    const badge = document.createElement('span');
+                    badge.className = 'slice-cuts-badge';
+                    badge.title = `Edited: ${n} region${n === 1 ? '' : 's'} removed. Open the editor to adjust.`;
+                    badge.innerHTML = '<i class="ph ph-scissors"></i>';
+                    badge.appendChild(document.createTextNode(` ${n} cut${n === 1 ? '' : 's'}`));
+                    time.appendChild(badge);
+                }
                 // The drag hint lives here rather than on the card: a card-wide title fires
                 // whenever the pointer rests anywhere while the user is just reading.
                 if (window.electronAPI && slice.filePath) time.title = 'Drag to your desktop or DAW';
@@ -5106,7 +5706,7 @@
                 playerDiv.appendChild(durDivider);
                 const durationEl = document.createElement('div');
                 durationEl.className = 'time-duration';
-                durationEl.innerHTML = `Duration: <span>${((slice.endTime - slice.startTime) / 1000).toFixed(2)}s</span>`;
+                durationEl.innerHTML = `Duration: <span>${sliceDurationSec(slice).toFixed(2)}s</span>`;
                 playerDiv.appendChild(durationEl);
 
                 // Action buttons inline with transport controls
