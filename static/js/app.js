@@ -202,7 +202,10 @@
                         chunks: slice.chunks || [],
                         // Regions removed in the slice editor (absolute source seconds). The saved
                         // file is already the kept parts joined; these let the editor reopen them.
-                        cuts: (slice.cuts || []).map(c => ({ start: c.start, end: c.end }))
+                        cuts: (slice.cuts || []).map(c => ({ start: c.start, end: c.end })),
+                        // Volume applied in the slice editor (linear, 1 = unchanged). Already baked
+                        // into the saved file; kept so the editor reopens at the same setting.
+                        gain: sanitizeGain(slice.gain)
                     })),
                     // Markers belong to audioFilePath; restoreSession only brings them back with it.
                     markers: markers.map(m => ({ id: m.id, time: m.time, n: m.n, name: m.name || '' })),
@@ -473,7 +476,8 @@
                                     filePath: savedSlice.filePath,
                                     sourceAudioPath: savedSlice.sourceAudioPath || null,
                                     chunks: savedSlice.chunks || [],
-                                    cuts: sanitizeCuts(savedSlice.cuts, savedSlice.start, savedSlice.end)
+                                    cuts: sanitizeCuts(savedSlice.cuts, savedSlice.start, savedSlice.end),
+                                    gain: sanitizeGain(savedSlice.gain)
                                 };
                                 slice.netDuration = netDuration(keptSegments(slice.start, slice.end, slice.cuts));
                                 
@@ -572,7 +576,9 @@
                 ]);
 
                 // A File-like the existing decoder accepts (it calls file.arrayBuffer()).
-                const demoFile = { name: DEMO_LABEL, size: clipBuf.byteLength, arrayBuffer: async () => clipBuf };
+                // A copy each time: decodeAudioData detaches the buffer it is given, and the slice
+                // exporter asks for the bytes again later to take the lossless path.
+                const demoFile = { name: DEMO_LABEL, size: clipBuf.byteLength, arrayBuffer: async () => clipBuf.slice(0) };
                 const loaded = await loadAudioFile(demoFile);
 
                 demoMode = true;
@@ -1466,6 +1472,98 @@
         }
         
         // Transcribe audio
+        // Whisper's decoder has 448 positions; the prefix (start, language, task) takes up to 3 of
+        // them. generate() turns max_new_tokens into max_length = prefix + max_new_tokens and does
+        // not clamp to the model, so this must leave room for the prefix itself.
+        const MAX_TOKENS_PER_WINDOW = 440;
+
+        // ---- Stopping a run ----
+        // There is no abort handle on the pipeline, so the streamer's callbacks — which fire for
+        // every decoded word — are the hook. A tagged error thrown from one unwinds generate() and
+        // the pipeline, and handleTranscribe's catch recognises the tag. On a CPU (WASM) run the
+        // renderer is frozen for the whole decode and a click can't be processed, so the button is
+        // only offered when the run is on the GPU.
+        let stopRequested = false;
+
+        function checkStopRequested() {
+            if (!stopRequested) return;
+            const err = new Error('Transcription stopped');
+            err.code = 'transcription-stopped';
+            throw err;
+        }
+
+        function setStopButtonVisible(show) {
+            const btn = document.getElementById('transcription-stop-btn');
+            if (!btn) return;
+            btn.style.display = (show && !runsOnCpu()) ? '' : 'none';
+            btn.disabled = false;
+        }
+
+        window.stopTranscription = function() {
+            if (stopRequested) return;
+            stopRequested = true;
+            const btn = document.getElementById('transcription-stop-btn');
+            if (btn) btn.disabled = true;
+            document.getElementById('transcription-loading-text').textContent = 'Stopping…';
+        };
+
+        // ---- Repetition loops ----
+        // When Whisper can't make sense of a stretch (music, silence, noise, crosstalk) it tends to
+        // repeat a short phrase until the window's token budget runs out. Real speech repeats
+        // things too — "no, no, no", "ha ha ha" — so the bar is set where speech doesn't go: a
+        // phrase of up to MAX_PHRASE words said at least MIN_REPEATS times in a row, covering at
+        // least MIN_WORDS words. The first copy is kept (it's usually where the real words are)
+        // and the rest of the span becomes one [unclear] chunk, so the gap stays visible and
+        // selectable rather than silently closing up. Pure function; exposed for tests.
+        const REPEAT_MAX_PHRASE = 8;
+        const REPEAT_MIN_REPEATS = 5;
+        const REPEAT_MIN_WORDS = 12;
+        const UNCLEAR_TEXT = '[unclear]';
+
+        function collapseRepeatedPhrases(chunks) {
+            const norm = chunks.map(c => String(c.text || '').toLowerCase().replace(/[^\p{L}\p{N}']+/gu, ''));
+            const out = [];
+            const runs = [];
+            let i = 0;
+            while (i < chunks.length) {
+                let best = null;
+                for (let n = 1; n <= REPEAT_MAX_PHRASE && i + n <= chunks.length; n++) {
+                    if (norm.slice(i, i + n).some(w => !w)) continue;   // punctuation-only tokens don't anchor a phrase
+                    let count = 1;
+                    while (i + (count + 1) * n <= chunks.length) {
+                        let same = true;
+                        for (let k = 0; k < n; k++) {
+                            if (norm[i + count * n + k] !== norm[i + k]) { same = false; break; }
+                        }
+                        if (!same) break;
+                        count++;
+                    }
+                    if (count >= REPEAT_MIN_REPEATS && count * n >= REPEAT_MIN_WORDS && (!best || count * n > best.count * best.n)) {
+                        best = { n, count };
+                    }
+                }
+                if (!best) { out.push(chunks[i]); i++; continue; }
+                const { n, count } = best;
+                const first = chunks.slice(i, i + n);
+                const rest = chunks.slice(i + n, i + count * n);
+                out.push(...first);
+                out.push({
+                    text: UNCLEAR_TEXT,
+                    timestamp: [rest[0].timestamp[0], rest[rest.length - 1].timestamp[1]],
+                    unclear: true
+                });
+                runs.push({
+                    phrase: first.map(c => String(c.text || '').trim()).join(' '),
+                    count,
+                    start: first[0].timestamp[0],
+                    end: rest[rest.length - 1].timestamp[1]
+                });
+                i += count * n;
+            }
+            return { chunks: out, runs };
+        }
+        window.collapseRepeatedPhrases = collapseRepeatedPhrases;   // test hook
+
         window.handleTranscribe = async function() {
             if (!currentFile) {
                 alert('Please select an audio file first');
@@ -1485,6 +1583,7 @@
             const contentDiv = document.getElementById('transcription-content');
             
             transcribeBtn.disabled = true;
+            stopRequested = false;
             loadingDiv.style.display = 'block';
             // Reset the unified loading card for a clean start (no stale stage/percent flash).
             document.getElementById('transcription-loading-text').textContent = 'Preparing…';
@@ -1547,6 +1646,16 @@
                     stride_length_s: 0,  // No overlap for faster processing
                     return_timestamps: 'word',  // Word-level timestamps for precise slicing
                     num_beams: 1,  // Greedy decoding stabilizes word timestamps
+                    // Hard cap per 30s window (the model's own ceiling is 448 positions, prefix
+                    // included). Setting it has a second, deliberate effect: transformers.js 4.x
+                    // runs a "seek loop" in timestamp mode that re-decodes a window from its last
+                    // timestamp pair, and when Whisper falls into a repetition loop those timestamps
+                    // barely move, so the same audio is decoded over and over with no exit (there is
+                    // no guard against a zero advance). The library skips the seek loop whenever
+                    // max_new_tokens is set explicitly, which bounds a bad window at one decode.
+                    // The cost is the seek loop's benefit — re-reading a window the model gave up on
+                    // early — which is the behaviour the app had before the 4.x upgrade anyway.
+                    max_new_tokens: MAX_TOKENS_PER_WINDOW,
                 };
 
                 // Progress reporting. Whisper decodes long audio in 30s windows, and the streamer's
@@ -1592,9 +1701,11 @@
 
                 // Absolute audio position from a window-relative streamer timestamp. A drop back
                 // toward 0 means a new 30s window began, so advance the base by one step.
+                const lastWindowBase = Math.max(0, (numExpectedChunks - 1) * chunkStep);
                 const advance = (t) => {
-                    if (t < lastRelT - 0.5) {
-                        windowBase += chunkStep;
+                    checkStopRequested();
+                    if (t < lastRelT - 0.5 && windowBase < lastWindowBase) {
+                        windowBase = Math.min(windowBase + chunkStep, lastWindowBase);
                         addLog(`Transcribed ${fmtClock(windowBase)} / ${fmtClock(duration)}`);
                     }
                     lastRelT = t;
@@ -1615,6 +1726,7 @@
                         on_chunk_start: advance,
                         on_chunk_end: advance,
                         callback_function: (text) => {
+                            checkStopRequested();
                             partial += text;
                             updateTranscriptionPreview(partial);
                         }
@@ -1632,6 +1744,7 @@
                 }
                 
                 let result;
+                setStopButtonVisible(true);
                 try {
                     result = await whisperPipeline(currentAudioBuffer, generationConfig);
                 } catch (gpuError) {
@@ -1668,6 +1781,7 @@
                     }
                 }
                 
+                setStopButtonVisible(false);
                 const inferenceTime = ((performance.now() - startTime) / 1000).toFixed(2);
                 const realtimeMultiplier = (duration / parseFloat(inferenceTime)).toFixed(2);
                 
@@ -1731,7 +1845,7 @@
                     }
                     
                     // Step 3: Remove overlapping chunks
-                    const nonOverlapping = [];
+                    let nonOverlapping = [];
                     
                     for (let i = 0; i < uniqueChunks.length; i++) {
                         const current = uniqueChunks[i];
@@ -1757,6 +1871,14 @@
                         }
                     }
                     
+                    // Step 4: Collapse Whisper's repetition loops ("Cassie, the Cassie, the Cassie…")
+                    // into one copy plus an [unclear] placeholder over the rest of the span.
+                    const collapsed = collapseRepeatedPhrases(nonOverlapping);
+                    for (const run of collapsed.runs) {
+                        addLog(`⚠️ Collapsed a repeated phrase — “${run.phrase}” × ${run.count} at ${fmtClock(run.start)}–${fmtClock(run.end)}. That stretch is marked [unclear].`);
+                    }
+                    nonOverlapping = collapsed.chunks;
+
                     // Update result with cleaned chunks
                     currentTranscription.chunks = nonOverlapping;
 
@@ -1844,8 +1966,10 @@
                 updateSlicesList();
                 
             } catch (error) {
-                addLog('❌ Error: ' + error.message);
-                console.error(error);
+                if (error.code !== 'transcription-stopped') {
+                    addLog('❌ Error: ' + error.message);
+                    console.error(error);
+                }
                 // A file that never opened isn't a transcription failure, and saying so sends people
                 // to check their model and language settings for no reason. loadAudioFile tags those
                 // two cases, and their own message already explains what to do.
@@ -1853,18 +1977,22 @@
                 // The user declined the model download at the confirmation prompt. They already know
                 // what happened — they're the one who said no — so there is nothing to alert about.
                 const declined = error.code === 'download-declined';
+                // The user pressed Stop. Nothing to explain either.
+                const stopped = error.code === 'transcription-stopped';
+                if (stopped) addLog('⏹ Transcription stopped.');
                 // Before the alert, not after: it blocks the renderer, and a modal sitting unseen
                 // behind a background window is exactly the case worth flagging.
                 setTaskbarProgress(TASKBAR_CLEAR);
                 if (window.electronAPI && window.electronAPI.signalFinished) {
                     window.electronAPI.signalFinished();
                 }
-                if (!declined) alert(fileProblem ? error.message : 'Transcription failed: ' + error.message);
+                if (!declined && !stopped) alert(fileProblem ? error.message : 'Transcription failed: ' + error.message);
                 emptyDiv.style.display = 'block';
                 loadingDiv.style.display = 'none';
                 showProcessingProgress(false);
                 resetTranscriptionPreview();
             } finally {
+                setStopButtonVisible(false);
                 transcribeBtn.disabled = false;
             }
         };
@@ -2486,7 +2614,9 @@
             editingSliceIndex: null,
             // Slice editor with cuts: the kept parts play as a chain of back-to-back sources
             // (see startChain). null on the single-range path the Transcription tab always uses.
-            chain: null
+            chain: null,
+            // Slice editor: the GainNode playback runs through (null elsewhere / when stopped).
+            gainNode: null
         };
 
         let _currentSelectionMatch = null;
@@ -3115,6 +3245,7 @@
         function updateDurationDisplay() {
             const duration = previewState.endTime - previewState.startTime;
             const { durationEl } = getWaveformEls();
+            if (inModal()) scheduleClipHint();
             if (!durationEl) return;
             // Slice editor with cuts: show what will actually be saved, and how much is cut.
             if (inModal() && editState.cuts?.length) {
@@ -3228,6 +3359,9 @@
             stopChain();
 
             const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            // Slice editor: everything plays through the slice's volume (live-adjustable, see
+            // setEditGain). The Transcription tab connects straight to the destination as before.
+            const output = editorOutput(audioContext);
 
             // Resume where we paused/seeked, but only if that's still inside the selection.
             let pos = previewState.pausedAt;
@@ -3237,7 +3371,7 @@
 
             if (segs) {
                 if (override) pos = segs[0].start;
-                pos = startChain(audioContext, oab, segs, pos, override ? false : previewState.isLooping);
+                pos = startChain(audioContext, oab, segs, pos, override ? false : previewState.isLooping, output);
                 previewState.audioSource = null;
             } else {
                 // Play the source buffer itself (no copy) so loopStart/loopEnd stay live-assignable.
@@ -3247,7 +3381,7 @@
                 source.loopStart = previewState.startTime;
                 source.loopEnd = previewState.endTime;
                 source.playbackRate.value = previewState.playbackSpeed;
-                source.connect(audioContext.destination);
+                source.connect(output);
                 source.start(0, pos);
 
                 previewState.audioSource = source;
@@ -3308,6 +3442,7 @@
         function releaseAudioContext() {
             const ctx = previewState.audioContext;
             previewState.audioContext = null;
+            previewState.gainNode = null;
             if (ctx) ctx.close().catch(() => { /* already closed */ });
         }
 
@@ -4193,15 +4328,15 @@
         // ── Chain playback: one BufferSource per kept segment, sample-accurate back to back ──
         // Returns the source position actually started from (a position inside a cut, or past the
         // last segment, moves to the next kept segment / wraps to the first).
-        function startChain(ctx, buffer, segs, pos, loop) {
-            const chain = { ctx, buffer, segs, loop, speed: previewState.playbackSpeed,
+        function startChain(ctx, buffer, segs, pos, loop, dest = ctx.destination) {
+            const chain = { ctx, buffer, segs, loop, dest, speed: previewState.playbackSpeed,
                             sources: [], table: [], timer: null, restartTimer: null, endsAt: 0 };
             previewState.chain = chain;
             return scheduleChain(chain, pos, ctx.currentTime);
         }
 
         function scheduleChain(chain, pos, when) {
-            const { ctx, buffer, segs, speed } = chain;
+            const { ctx, buffer, segs, speed, dest } = chain;
             let i = segs.findIndex(s => pos < s.end - 1e-6);
             if (i < 0) { i = 0; pos = segs[0].start; }
             if (pos < segs[i].start) pos = segs[i].start;
@@ -4214,7 +4349,7 @@
                 const src = ctx.createBufferSource();
                 src.buffer = buffer;
                 src.playbackRate.value = speed;
-                src.connect(ctx.destination);
+                src.connect(dest);
                 src.start(t, off, dur);
                 src.onended = () => { const j = chain.sources.indexOf(src); if (j >= 0) chain.sources.splice(j, 1); };
                 chain.sources.push(src);
@@ -4545,6 +4680,98 @@
             handleCutKey();
         });
 
+
+        // ── Slice volume (slice editor only) ───────────────────────────────────────────────────
+        // editState.gain: linear 0..2 (the slider shows 0–200%). Playback runs through a GainNode
+        // that follows the slider live; the saved file has the gain baked in (see
+        // exportSourceQualitySlice). The Transcription tab never has a gain.
+        function sanitizeGain(g) {
+            const n = Number(g);
+            return Number.isFinite(n) ? Math.max(0, Math.min(2, n)) : 1;
+        }
+        const editGain = () => inModal() ? sanitizeGain(editState.gain) : 1;
+
+        // Where the preview engine connects its sources: a GainNode in the editor, else the
+        // context's destination (the Transcription tab's path is unchanged).
+        function editorOutput(ctx) {
+            if (!inModal()) return ctx.destination;
+            const g = ctx.createGain();
+            g.gain.value = editGain();
+            g.connect(ctx.destination);
+            previewState.gainNode = g;
+            return g;
+        }
+
+        function setEditGain(pct) {
+            if (!inModal()) return;
+            editState.gain = sanitizeGain(Math.round(Number(pct)) / 100);
+            if (previewState.gainNode) previewState.gainNode.gain.value = editState.gain;
+            syncVolumeUI();
+        }
+        window.setEditGain = setEditGain;
+
+        // Slider, icon and readout from editState.gain, plus the clipping hint.
+        function syncVolumeUI() {
+            const slider = document.getElementById('edit-volume-slider');
+            const icon = document.getElementById('edit-volume-icon');
+            const readout = document.getElementById('edit-volume-readout');
+            const pct = Math.round(editGain() * 100);
+            if (slider && Number(slider.value) !== pct) slider.value = String(pct);
+            if (slider) slider.style.setProperty('--fill', `${pct / 2}%`);
+            if (icon) icon.className = 'ph ' + (pct === 0 ? 'ph-speaker-x' : 'ph-speaker-high');
+            if (readout) readout.textContent = `${pct}%`;
+            updateClipHint();
+        }
+
+        // Peak |sample| over the kept audio (handles minus cuts, all channels), cached per range.
+        function keptPeak() {
+            const buf = activeOriginalBuffer();
+            if (!inModal() || !buf) return 0;
+            const segs = keptSegments(previewState.startTime, previewState.endTime, editCuts());
+            const key = segs.map(s => s.start.toFixed(6) + '-' + s.end.toFixed(6)).join(',');
+            if (editState.peakCache && editState.peakCache.key === key) return editState.peakCache.peak;
+            let peak = 0;
+            const sr = buf.sampleRate;
+            for (let c = 0; c < buf.numberOfChannels; c++) {
+                const d = buf.getChannelData(c);
+                for (const s of segs) {
+                    const a = Math.max(0, Math.floor(s.start * sr)), b = Math.min(d.length, Math.ceil(s.end * sr));
+                    for (let i = a; i < b; i++) { const v = d[i] < 0 ? -d[i] : d[i]; if (v > peak) peak = v; }
+                }
+            }
+            editState.peakCache = { key, peak };
+            return peak;
+        }
+
+        function updateClipHint() {
+            const readout = document.getElementById('edit-volume-readout');
+            if (!readout) return;
+            const clips = inModal() && editGain() > 1 && keptPeak() * editGain() > 1;
+            readout.classList.toggle('clipping', clips);
+            readout.title = clips ? 'Louder than the file can hold — the loudest parts will clip'
+                                  : 'Slice volume (double-click to reset to 100%)';
+        }
+        // Handles/cuts move many times a second while dragging; re-measure once they settle.
+        let _clipHintTimer = null;
+        function scheduleClipHint() {
+            clearTimeout(_clipHintTimer);
+            _clipHintTimer = setTimeout(() => { _clipHintTimer = null; if (inModal()) updateClipHint(); }, 150);
+        }
+
+        document.addEventListener('input', (e) => {
+            if (e.target.id === 'edit-volume-slider') setEditGain(e.target.value);
+        });
+        document.addEventListener('dblclick', (e) => {
+            if (closestEl(e.target, '#edit-volume-slider, #edit-volume-readout')) setEditGain(100);
+        });
+        // Keys typed while the slider has focus belong to it: don't let them reach the slice
+        // shortcuts (X, M, [ ]). Space still plays/pauses, so you can adjust and listen.
+        document.addEventListener('keydown', (e) => {
+            if (e.target.id !== 'edit-volume-slider') return;
+            if (e.key === ' ' || e.key === 'Escape') return;
+            e.stopPropagation();
+        }, true);
+
         // ── Slice naming / export filenames ─────────────────────────────────────────
         const DEFAULT_FILENAME_TEMPLATE = '{source}_{index}_{slug}';
 
@@ -4683,12 +4910,14 @@
 
         // Shared audio extraction + save logic used by createSlice and updateSlice
         // `cuts` (slice editor): regions to leave out; the file is the kept parts joined.
-        async function buildSliceEntry(startTime, endTime, text, name, cuts = []) {
+        // `gain` (slice editor): linear volume baked into the file; 1 leaves the audio untouched.
+        async function buildSliceEntry(startTime, endTime, text, name, cuts = [], gain = 1) {
+            gain = sanitizeGain(gain);
             const keptCuts = clipCuts(cuts, startTime, endTime);
             const segments = keptSegments(startTime, endTime, keptCuts);
             if (!segments.length) throw new Error('Every part of this slice is cut — nothing to save');
             addLog(`🎵 Exporting slice at source quality...`);
-            const blob = await exportSourceQualitySlice(segments);
+            const blob = await exportSourceQualitySlice(segments, gain);
             if (!blob || blob.size <= 44) throw new Error('Failed to extract audio slice');
             addLog(`✅ WAV created: ${(blob.size / 1024).toFixed(1)}KB`);
             const url = URL.createObjectURL(blob);
@@ -4710,7 +4939,7 @@
             return { text, name: name || slugify(text), startTime: startTime * 1000, endTime: endTime * 1000,
                      start: startTime, end: endTime, url, blob, filePath,
                      sourceAudioPath: activeFile()?.path || null, chunks,
-                     cuts: keptCuts, netDuration: netDuration(segments) };
+                     cuts: keptCuts, netDuration: netDuration(segments), gain };
         }
 
         // Word timings relative to the exported file: words inside a cut are dropped, later words
@@ -4880,7 +5109,8 @@
                 const keepName = (old && old.name && old.name !== slugify(old.text)) ? old.name : undefined;
                 // The editor's cuts, clipped to the final handles (a cut dragged outside is dropped).
                 const cuts = inModal() ? clipCuts(editState.cuts, startTime, endTime) : [];
-                const entry = await buildSliceEntry(startTime, endTime, selectedText, keepName, cuts);
+                const gain = inModal() ? sanitizeGain(editState.gain) : 1;
+                const entry = await buildSliceEntry(startTime, endTime, selectedText, keepName, cuts, gain);
 
                 if (!saveAsNew && editingSliceIndex !== null) {
                     if (slices[editingSliceIndex].url) URL.revokeObjectURL(slices[editingSliceIndex].url);
@@ -4965,6 +5195,9 @@
             // Working copy of the slice's cuts: Cancel discards it, Update / Save as new keep it.
             editState.cuts = normalizeCuts(slice.cuts || []);
             editState.pendingCut = null;
+            // Working copy of the slice's volume, same lifecycle as the cuts.
+            editState.gain = sanitizeGain(slice.gain);
+            editState.peakCache = null;
 
             mountSliceEditor(sliceIndex);
 
@@ -4973,6 +5206,7 @@
             // reads the container width, which forces the layout it needs — no timer required.
             waveformContext = 'modal';
             enterSelectionMode(slice.start, slice.end);
+            syncVolumeUI();   // needs the modal context and the handles just set
         };
 
         // Move the single #slice-editor panel into the given slice's item (replacing its
@@ -5000,6 +5234,7 @@
             cutEdgeDrag = null;
             const cutsLayer = document.getElementById('edit-waveform-cuts');
             if (cutsLayer) cutsLayer.innerHTML = '';
+            clearTimeout(_clipHintTimer);
             waveformContext = 'transcription';
             const editedIndex = previewState.editingSliceIndex;
             // Return the editor panel to its hidden holder (never destroyed by list rebuilds).
@@ -5184,6 +5419,8 @@
                 chunks.push({ id, bodyOffset, size });
                 if (id === 'fmt ') {
                     fmt = {
+                        // WAVE_FORMAT_EXTENSIBLE: the real format code leads the SubFormat GUID.
+                        subFormat: size >= 40 ? dv.getUint16(bodyOffset + 24, true) : null,
                         audioFormat: dv.getUint16(bodyOffset, true),
                         numChannels: dv.getUint16(bodyOffset + 2, true),
                         sampleRate: dv.getUint32(bodyOffset + 4, true),
@@ -5201,7 +5438,8 @@
 
         // Rebuild a WAV containing only the given [{start,end}] ranges (joined, in order), copying
         // every chunk verbatim except `data` (replaced by the sliced bytes) → byte-identical quality.
-        function sliceWavLossless(ab, parsed, segments) {
+        // `gain`/`kind` (optional): scale the copied samples in place (see applyGainToPcm).
+        function sliceWavLossless(ab, parsed, segments, gain = 1, kind = null) {
             const { sampleRate, blockAlign, dataChunk, chunks } = parsed;
             const ranges = segments.map(({ start, end }) => {
                 let startByte = Math.round(start * sampleRate) * blockAlign;
@@ -5231,6 +5469,7 @@
                         out.set(new Uint8Array(ab, dataChunk.bodyOffset + s, e - s), w);
                         w += e - s;
                     }
+                    if (gain !== 1 && kind) applyGainToPcm(out, o + 8, sliceLen, kind, gain);
                     o += 8 + sliceLen + (sliceLen & 1);
                 } else {
                     odv.setUint32(o + 4, c.size, true);
@@ -5242,8 +5481,8 @@
         }
 
         // Re-encode [{start,end}] ranges of a decoded AudioBuffer, joined, to interleaved PCM WAV
-        // (default 24-bit).
-        function audioBufferRangeToWav(buffer, segments, bitDepth = 24) {
+        // (default 24-bit). `gain` scales the samples before the usual clip to full scale.
+        function audioBufferRangeToWav(buffer, segments, bitDepth = 24, gain = 1) {
             const sampleRate = buffer.sampleRate;
             const numChannels = buffer.numberOfChannels;
             const sampleRanges = segments.map(({ start, end }) => {
@@ -5282,7 +5521,7 @@
             for (const [startSample, endSample] of sampleRanges)
             for (let i = startSample; i < endSample; i++) {
                 for (let c = 0; c < numChannels; c++) {
-                    let s = Math.max(-1, Math.min(1, chans[c][i]));
+                    let s = Math.max(-1, Math.min(1, chans[c][i] * gain));
                     const v = Math.round(s < 0 ? s * negMax : s * posMax);
                     if (bitDepth === 24) {
                         view.setUint8(offset, v & 0xff);
@@ -5299,16 +5538,55 @@
 
         // Produce a source-quality WAV blob of the active file's [{start,end}] segments, joined:
         // byte-exact for uncompressed WAV, otherwise re-encoded from the decoded buffer.
-        async function exportSourceQualitySlice(segments) {
+        // `gain` ≠ 1 scales the samples (hard-clipped): in the file's own format on the byte-copy
+        // path when it's 16/24/32-bit int or 32-bit float PCM, else via the decoded buffer.
+        async function exportSourceQualitySlice(segments, gain = 1) {
             const bytes = await readSourceBytes(activeFile());
             const parsed = bytes && parseWavChunks(bytes);
             // Byte-copy is only valid for constant-block-align formats (PCM/float/extensible).
             if (parsed && [1, 3, 0xFFFE].includes(parsed.audioFormat)) {
-                return sliceWavLossless(bytes, parsed, segments);
+                if (gain === 1) return sliceWavLossless(bytes, parsed, segments);
+                const kind = pcmSampleKind(parsed);
+                if (kind) return sliceWavLossless(bytes, parsed, segments, gain, kind);
             }
             const buf = activeOriginalBuffer();
             if (!buf) throw new Error('No source audio available for export');
-            return audioBufferRangeToWav(buf, segments, 24);
+            return audioBufferRangeToWav(buf, segments, 24, gain);
+        }
+
+        // The sample encoding of a parsed WAV, for in-place gain: 'i16' | 'i24' | 'i32' | 'f32',
+        // or null for anything else (8-bit, 64-bit float, odd containers).
+        function pcmSampleKind(parsed) {
+            const fmt = parsed.audioFormat === 0xFFFE ? parsed.subFormat : parsed.audioFormat;
+            const bits = parsed.bitsPerSample;
+            const bytesPer = parsed.numChannels ? parsed.blockAlign / parsed.numChannels : 0;
+            if (fmt === 1 && bits === bytesPer * 8 && [16, 24, 32].includes(bits)) return 'i' + bits;
+            if (fmt === 3 && bits === 32 && bytesPer === 4) return 'f32';
+            return null;
+        }
+
+        // Multiply the little-endian samples in out[start, start+len) by gain, hard-clipping to
+        // full scale. Integers round to nearest.
+        function applyGainToPcm(out, start, len, kind, gain) {
+            const dv = new DataView(out.buffer, out.byteOffset);
+            const end = start + len;
+            if (kind === 'i16') {
+                for (let o = start; o + 2 <= end; o += 2)
+                    dv.setInt16(o, Math.max(-32768, Math.min(32767, Math.round(dv.getInt16(o, true) * gain))), true);
+            } else if (kind === 'i24') {
+                for (let o = start; o + 3 <= end; o += 3) {
+                    let v = out[o] | (out[o + 1] << 8) | (out[o + 2] << 16);
+                    if (v & 0x800000) v -= 0x1000000;
+                    v = Math.max(-8388608, Math.min(8388607, Math.round(v * gain)));
+                    out[o] = v & 0xff; out[o + 1] = (v >> 8) & 0xff; out[o + 2] = (v >> 16) & 0xff;
+                }
+            } else if (kind === 'i32') {
+                for (let o = start; o + 4 <= end; o += 4)
+                    dv.setInt32(o, Math.max(-2147483648, Math.min(2147483647, Math.round(dv.getInt32(o, true) * gain))), true);
+            } else if (kind === 'f32') {
+                for (let o = start; o + 4 <= end; o += 4)
+                    dv.setFloat32(o, Math.max(-1, Math.min(1, dv.getFloat32(o, true) * gain)), true);
+            }
         }
         
         function populateSliceTextOverlay(textLayer, chunks, duration, canvasWidth) {
@@ -5500,6 +5778,17 @@
                     badge.title = `Edited: ${n} region${n === 1 ? '' : 's'} removed. Open the editor to adjust.`;
                     badge.innerHTML = '<i class="ph ph-scissors"></i>';
                     badge.appendChild(document.createTextNode(` ${n} cut${n === 1 ? '' : 's'}`));
+                    time.appendChild(badge);
+                }
+                // Volume changed in the slice editor (already in the file).
+                if (sanitizeGain(slice.gain) !== 1) {
+                    const pct = Math.round(sanitizeGain(slice.gain) * 100);
+                    time.appendChild(document.createTextNode(' '));
+                    const badge = document.createElement('span');
+                    badge.className = 'slice-gain-badge';
+                    badge.title = `Volume ${pct}%. Open the editor to adjust.`;
+                    badge.innerHTML = `<i class="ph ${pct === 0 ? 'ph-speaker-x' : 'ph-speaker-high'}"></i>`;
+                    badge.appendChild(document.createTextNode(` ${pct}%`));
                     time.appendChild(badge);
                 }
                 // The drag hint lives here rather than on the card: a card-wide title fires

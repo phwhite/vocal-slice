@@ -72,6 +72,11 @@
                     </div>
                     <!-- Words stream in here while decoding, so a long run visibly isn't stuck. -->
                     <div id="transcription-preview" class="transcription-preview" style="display:none;"></div>
+                    <!-- Shown only while the model is decoding on the GPU (see setStopButtonVisible). -->
+                    <button type="button" class="btn btn-stop" id="transcription-stop-btn" onclick="stopTranscription()" style="display:none;" title="Stop transcribing and discard this run">
+                        <i class="ph ph-stop"></i>
+                        Stop
+                    </button>
                 </div>
                 
                 <div id="transcription-content" style="display: none;">
@@ -702,6 +707,11 @@
                 <button class="transport-btn" id="edit-cut-btn" title="Cut: drag across the waveform to remove a region">
                     <i class="ph ph-scissors"></i>
                 </button>
+                <div class="edit-volume" title="Slice volume">
+                    <i class="ph ph-speaker-high" id="edit-volume-icon" aria-hidden="true"></i>
+                    <input type="range" id="edit-volume-slider" min="0" max="200" step="1" value="100" aria-label="Slice volume, percent">
+                    <span id="edit-volume-readout" class="edit-volume-readout" title="Slice volume (double-click to reset to 100%)">100%</span>
+                </div>
                 <div class="transport-divider"></div>
                 <select id="edit-playback-speed" class="transport-select" title="Playback speed">
                     <option value="0.5">0.5x</option>
@@ -711,6 +721,8 @@
                     <option value="1.5">1.5x</option>
                     <option value="2">2x</option>
                 </select>
+                <!-- Row break for a narrow editor (see .transport-break): times + actions go below. -->
+                <div class="transport-break" aria-hidden="true"></div>
                 <div class="transport-divider"></div>
                 <div class="time-input-group">
                     <label>Start:</label>

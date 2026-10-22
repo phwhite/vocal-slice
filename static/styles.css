@@ -1802,6 +1802,26 @@ select:focus {
     font-weight: 500;
 }
 
+/* Stop button in the loading card: quiet by default, red on hover, so it reads as an
+   escape hatch rather than the next step. */
+.btn.btn-stop {
+    margin: 16px auto 0;
+    padding: 8px 16px;
+    min-height: 0;
+    font-size: 13px;
+    background: transparent;
+    color: var(--subtext0);
+    border: 1px solid var(--surface1);
+    box-shadow: none;
+}
+
+.btn.btn-stop:hover:not(:disabled) {
+    color: var(--red);
+    border-color: var(--red);
+    box-shadow: none;
+    transform: none;
+}
+
 /* Live decode preview inside the loading card */
 /* Live decode preview: an un-boxed, bottom-anchored viewport. Newest text sits at the bottom and
    older lines spill off the top, faded out by the mask — an ambient "still working" indicator.
@@ -2386,6 +2406,33 @@ audio::-webkit-media-controls-volume-slider {
     margin-bottom: 8px;
 }
 
+/* The editor's transport carries the most controls (cut, volume, time fields, save buttons).
+   When the editor is too narrow for one row, break deliberately after the speed menu so the
+   time fields and the save buttons move down together, rather than stranding a button or
+   running past the card. The plain wrap is the fallback if even two rows don't fit. */
+.slice-editor {
+    container: slice-editor / inline-size;
+}
+.slice-editor .transport-controls {
+    flex-wrap: wrap;
+    row-gap: 4px;
+    max-width: 100%;
+    box-sizing: border-box;
+}
+.transport-break {
+    display: none;
+}
+@container slice-editor (max-width: 940px) {
+    .slice-editor .transport-break {
+        display: block;
+        flex-basis: 100%;
+        height: 0;
+    }
+    .slice-editor .transport-break + .transport-divider {
+        display: none;
+    }
+}
+
 /* While editing, hide this slice's own cut-preview waveform and its cut-`.wav` transport
    row (direct children) so only the editor shows — not the editor's own waveform/transport,
    which are nested inside .slice-editor-slot. */
@@ -2919,6 +2966,68 @@ audio::-webkit-media-controls-volume-slider {
     font-weight: 600;
     line-height: 17px;
     vertical-align: 1px;
+}
+
+/* Slices card: volume changed in the editor. */
+.slice-gain-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 0 6px;
+    border-radius: 9px;
+    background: color-mix(in srgb, var(--blue) 18%, transparent);
+    color: var(--blue);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 17px;
+    vertical-align: 1px;
+}
+
+/* Slice-editor volume: speaker icon, 0–200% slider, readout. The track fills to the thumb
+   (--fill, set from JS) with the accent; the 100% point is the middle of the track. */
+.edit-volume {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 2px 0 4px;
+    color: var(--subtext0);
+    font-size: 17px;
+}
+#edit-volume-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 64px;
+    height: 4px;
+    margin: 0;
+    border-radius: 2px;
+    background: linear-gradient(to right, var(--blue) 0 var(--fill, 50%), var(--surface2) var(--fill, 50%) 100%);
+    cursor: pointer;
+}
+#edit-volume-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--text);
+    border: 2px solid var(--surface0);
+    box-shadow: 0 0 0 1px var(--surface2);
+}
+#edit-volume-slider:focus-visible {
+    outline: 2px solid var(--blue);
+    outline-offset: 4px;
+}
+.edit-volume-readout {
+    min-width: 36px;
+    font-family: monospace;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    text-align: right;
+    cursor: default;
+    user-select: none;
+}
+.edit-volume-readout.clipping {
+    color: var(--red);
 }
 
 #markers-pane-btn.pane-open {
