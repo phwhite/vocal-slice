@@ -96,6 +96,18 @@ harness exists to catch things reasoning about the code does not.
 
 Every one of these cost real time.
 
+- **Check the app isn't already running before `launch`** — `pgrep -fl "vocal-slice.*Electron\.app/Contents/MacOS/Electron"`
+  (or `Get-Process electron` on Windows). The harness instance shares the user's profile, and if
+  the user's own instance holds the Local Storage lock, Chromium hands the harness an **empty
+  in-memory localStorage**: no session restores, `localStorage` lists only the keys the app writes
+  at startup, and nothing set during the run survives a quit. It looks exactly like wiped or
+  broken persistence and it is neither — the on-disk database is untouched. Persistence can only
+  be tested with the user's instance closed.
+- **Never clear or bulk-rewrite `localStorage` from an `eval`, and never keep a "snapshot" of it in
+  page memory across a `location.reload()`** — the reload discards it, and a `clear()` that then
+  fails to restore has already deleted the user's session. Use `window.loadDemo()` for runs that
+  need audio; the demo never saves a session.
+
 - **`ELECTRON_RUN_AS_NODE=1` is set in the agent environment.** With it set, Electron's binary
   deliberately behaves as plain Node: `--version` reports the *bundled* Node version and
   `require('electron')` fails. It looks exactly like a corrupt install — it isn't. `cleanEnv()` in

@@ -34,6 +34,14 @@
                 
                 <!-- Status Icons -->
                 <div class="status-icons">
+                    <!-- Play through: which output device every playback surface uses (see initOutputDevice). -->
+                    <div class="output-device" id="output-device" title="Play through: System default">
+                        <i class="ph ph-speaker-high" aria-hidden="true"></i>
+                        <select id="output-device-select" aria-label="Play through" onchange="setOutputDevice(this.value)">
+                            <option value="">System default</option>
+                        </select>
+                        <i class="ph ph-caret-down output-device-caret" aria-hidden="true"></i>
+                    </div>
                     <button class="theme-toggle" onclick="toggleTheme()" title="Toggle light/dark mode">
                         <i class="ph-fill ph-moon" id="theme-icon"></i>
                     </button>

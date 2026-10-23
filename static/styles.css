@@ -594,6 +594,67 @@ h1 {
     margin-bottom: -2px !important;
 }
 
+/* "Play through" pull-down in the title bar: a pill the same height and finish as the theme
+   toggle, wrapping a native <select> with its own chrome stripped so the pill supplies it. */
+.output-device {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 32px;
+    padding: 0 8px 0 10px;
+    border-radius: 8px;
+    background: var(--surface0);
+    border: 2px solid var(--surface1);
+    color: var(--text);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.output-device:hover {
+    background: var(--surface1);
+    border-color: var(--surface2);
+}
+
+.output-device > i {
+    font-size: 15px;
+    color: var(--subtext0);
+    pointer-events: none;
+}
+
+.output-device.missing > i:first-child {
+    color: var(--peach);
+}
+
+.output-device select {
+    appearance: none;
+    -webkit-appearance: none;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font: inherit;
+    font-size: 12.5px;
+    font-weight: 600;
+    max-width: 160px;
+    padding: 0;
+    margin: 0;
+    cursor: pointer;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.output-device select:focus-visible {
+    outline: 2px solid var(--blue);
+    outline-offset: 2px;
+    border-radius: 4px;
+}
+
+.output-device-caret {
+    font-size: 11px !important;
+}
+
 .theme-toggle {
     width: 32px !important;
     height: 32px !important;

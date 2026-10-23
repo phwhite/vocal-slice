@@ -24,6 +24,7 @@ the commit that renamed a heading would itself bump the count and make that head
 
 ## Unreleased
 
+- A **Play through** pull-down in the title bar, next to the light/dark switch, chooses which output device Vocal Slice plays to — headphones, an interface, a virtual device — without changing your system output. It applies to the Transcription tab, the slice editor and the clips on the Slices tab, and switches mid-play. If the chosen device is unplugged, playback falls back to the system default and comes back to it when it reappears.
 - Fixed transcription getting stuck forever when Whisper falls into a loop on a stretch it can't make out — music, silence, background noise — repeating the same few words ("Cassie, the Cassie, the Cassie…") while the status sat on "Lining up the words". The transcription library had started re-reading such a stretch from the same point over and over; each stretch is now read once and the run moves on.
 - When Whisper does repeat itself like that, the transcript no longer fills with the repeated phrase. You get the phrase once, then an **[unclear]** marker covering the rest of that stretch, so you can see where it happened and listen for yourself. The Log tab says what was collapsed and where.
 - There's now a **Stop** button under the progress bar while a transcription is running on the graphics card, so a run that has gone wrong can be stopped without quitting the app. (On a processor-only run the window is frozen while it works, so the button isn't offered there.)

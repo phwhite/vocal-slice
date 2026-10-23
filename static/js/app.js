@@ -3359,6 +3359,7 @@
             stopChain();
 
             const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            applyOutputDevice(audioContext);   // "Play through" pull-down in the title bar
             // Slice editor: everything plays through the slice's volume (live-adjustable, see
             // setEditGain). The Transcription tab connects straight to the destination as before.
             const output = editorOutput(audioContext);
@@ -3473,6 +3474,126 @@
             // Hide playhead
             sPlayhead.classList.remove('playing');
         };
+
+        // ============================================
+        // PLAY THROUGH (audio output device)
+        // ============================================
+        // One preference for every playback surface: Engine A's AudioContext (Transcription tab
+        // and slice editor, created per play in playPreview) and Engine B's per-card <audio>
+        // elements. Both take setSinkId. '' means the system default. Device ids are stable per
+        // profile but not forever (clearing site data re-salts them), so the label is kept too and
+        // used as the fallback match. Enumeration is local: nothing here leaves the machine.
+        const OUTPUT_DEVICE_KEY = 'vocalslice-output-device';
+        let outputDevice = { id: '', label: '' };
+        let outputDeviceMissing = false;    // chosen device isn't connected right now
+        let outputDevicesReady = false;     // first enumeration done (gates the "disconnected" toast)
+        try {
+            const saved = JSON.parse(localStorage.getItem(OUTPUT_DEVICE_KEY) || 'null');
+            if (saved && typeof saved.id === 'string') outputDevice = { id: saved.id, label: String(saved.label || '') };
+        } catch { /* storage off or unreadable: system default */ }
+
+        function persistOutputDevice() {
+            try { localStorage.setItem(OUTPUT_DEVICE_KEY, JSON.stringify(outputDevice)); } catch { /* storage off */ }
+        }
+
+        // "Default - MacBook Pro Speakers (Built-in)" → "MacBook Pro Speakers": the pill is narrow.
+        function shortDeviceLabel(label) {
+            return String(label || '').replace(/^Default - /, '').replace(/\s*\([^)]*\)\s*$/, '').trim() || 'Output device';
+        }
+
+        // The sink to use right now: the chosen device, or the default while it's unplugged.
+        const effectiveSinkId = () => (outputDevice.id && !outputDeviceMissing) ? outputDevice.id : '';
+
+        async function listOutputDevices() {
+            try {
+                const all = await navigator.mediaDevices.enumerateDevices();
+                // Chromium's 'default'/'communications' aliases duplicate real devices; the
+                // "System default" option (sink '') already covers them.
+                return all.filter(d => d.kind === 'audiooutput' && d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications');
+            } catch { return []; }
+        }
+
+        // Route one AudioContext or <audio> element. Fire-and-forget: setSinkId is async and the
+        // callers (playPreview, card render) are not. A rejection means the device vanished
+        // between enumeration and use; drop to the default and let refresh tell the user once.
+        function applyOutputDevice(target) {
+            if (!target || typeof target.setSinkId !== 'function') return;
+            const id = effectiveSinkId();
+            if (id === (target.sinkId || '')) return;
+            target.setSinkId(id).catch(() => {
+                if (!outputDeviceMissing) { outputDeviceMissing = true; refreshOutputDevices(); }
+            });
+        }
+
+        function applyOutputDeviceEverywhere() {
+            if (previewState.audioContext) applyOutputDevice(previewState.audioContext);
+            document.querySelectorAll('#slices-list audio').forEach(applyOutputDevice);
+        }
+
+        function updateOutputDeviceTitle() {
+            const wrap = document.getElementById('output-device');
+            if (!wrap) return;
+            const name = outputDevice.id ? shortDeviceLabel(outputDevice.label) : 'System default';
+            wrap.title = outputDeviceMissing
+                ? `Play through: ${name} (not connected — using the system default)`
+                : `Play through: ${name}`;
+            wrap.classList.toggle('missing', outputDeviceMissing);
+        }
+
+        // Rebuild the pull-down from the current device list and re-route live playback. Runs at
+        // startup and on every devicechange, so plugging a device in or out is reflected at once.
+        async function refreshOutputDevices() {
+            const sel = document.getElementById('output-device-select');
+            if (!sel) return;
+            const devices = await listOutputDevices();
+            let match = devices.find(d => d.deviceId === outputDevice.id)
+                || (outputDevice.label ? devices.find(d => d.label === outputDevice.label) : null);
+            if (match && match.deviceId !== outputDevice.id) { outputDevice.id = match.deviceId; persistOutputDevice(); }
+            const wasMissing = outputDeviceMissing;
+            outputDeviceMissing = !!outputDevice.id && !match;
+
+            sel.innerHTML = '';
+            const def = document.createElement('option');
+            def.value = ''; def.textContent = 'System default'; def.title = 'Follow the system output device';
+            sel.appendChild(def);
+            for (const d of devices) {
+                const o = document.createElement('option');
+                o.value = d.deviceId; o.textContent = shortDeviceLabel(d.label); o.title = d.label;
+                sel.appendChild(o);
+            }
+            sel.value = effectiveSinkId();
+            updateOutputDeviceTitle();
+
+            if (outputDevicesReady && outputDeviceMissing && !wasMissing) {
+                showToast(`${shortDeviceLabel(outputDevice.label)} isn't connected — playing through the system default`, { icon: 'ph ph-speaker-slash' });
+            } else if (outputDevicesReady && !outputDeviceMissing && wasMissing) {
+                showToast(`Playing through ${shortDeviceLabel(outputDevice.label)} again`, { icon: 'ph ph-speaker-high' });
+            }
+            outputDevicesReady = true;
+            applyOutputDeviceEverywhere();
+        }
+
+        window.setOutputDevice = function(id) {
+            const sel = document.getElementById('output-device-select');
+            const opt = sel ? [...sel.options].find(o => o.value === id) : null;
+            outputDevice = { id: id || '', label: (id && opt) ? opt.title : '' };
+            outputDeviceMissing = false;
+            persistOutputDevice();
+            updateOutputDeviceTitle();
+            applyOutputDeviceEverywhere();
+            addLog(`🔈 Play through: ${id ? shortDeviceLabel(outputDevice.label) : 'system default'}`);
+            if (sel) sel.blur();   // give the keyboard back to the app's shortcuts
+        };
+
+        function initOutputDevice() {
+            if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== 'function') {
+                const wrap = document.getElementById('output-device');
+                if (wrap) wrap.style.display = 'none';
+                return;
+            }
+            refreshOutputDevices();
+            navigator.mediaDevices.addEventListener('devicechange', () => refreshOutputDevices());
+        }
 
         // Silence every playback surface: Engine A (Web Audio preview / edit, via stopPreview)
         // + Engine B (the per-slice native <audio> elements). Single source of truth for
@@ -5821,6 +5942,7 @@
                 
                 const audio = document.createElement('audio');
                 audio.src = slice.url;
+                applyOutputDevice(audio);   // "Play through" pull-down in the title bar
                 item.appendChild(audio);
 
                 // Waveform
@@ -6789,6 +6911,7 @@
             loadProcessingSettings(); // Load saved preferences after UI is initialized
             updateLanguageSelector();
             window.loadTranscriptionPreferences();
+            initOutputDevice();
 
             window.toggleLogTab = function(enabled) {
                 localStorage.setItem('showLogTab', enabled ? 'true' : 'false');
