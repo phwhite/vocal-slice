@@ -3877,7 +3877,8 @@
             // selection here would restart playback from the selection start and undo the
             // play/stop, jump or marker the key just made.
             if (e.key === ' ' || e.key === 'm' || e.key === '[' || e.key === ']' ||
-                e.key === 'x' || e.key === 'X' || e.key === 'Escape') return;
+                e.key === 'x' || e.key === 'X' || e.key === 'Escape' ||
+                e.key === 'ArrowLeft' || e.key === 'ArrowRight') return;
             if (e.target.id === 'transcription-text') handleTranscriptionSelection(true);
         });
         document.addEventListener('mousedown', (e) => {
@@ -4334,6 +4335,30 @@
             e.preventDefault();
             if (e.key === 'm') { if (!e.repeat) window.addMarkerAtPlayhead(); }
             else jumpToAdjacentMarker(e.key === '[' ? -1 : 1);
+        });
+
+        // ← / → seek 10 s back or forward within the current selection, playing or paused: the
+        // same guard as the space bar, no modifiers (so Cmd/Alt-arrow keep their meaning in fields
+        // that use them). The seek also moves the space bar's cue, like a click on the waveform.
+        const ARROW_SEEK_SECONDS = 10;
+        document.addEventListener('keydown', (e) => {
+            if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+            if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+            const el = document.activeElement;
+            const editable = el && (
+                (el.tagName === 'INPUT' && !['button', 'checkbox', 'radio', 'range'].includes(el.type)) ||
+                el.tagName === 'SELECT' ||
+                (el.tagName === 'TEXTAREA' && !el.readOnly) ||
+                el.isContentEditable
+            );
+            if (editable || !activeOriginalBuffer() || !previewPaneVisible()) return;
+            e.preventDefault();
+            const dir = e.key === 'ArrowLeft' ? -1 : 1;
+            const lo = previewState.startTime;
+            // Forward never quite reaches the end, so there is still something left to play.
+            const hi = Math.max(lo, previewState.endTime - 0.05);
+            const target = Math.max(lo, Math.min(hi, currentPlayheadTime() + dir * ARROW_SEEK_SECONDS));
+            seekToTime(target);
         });
 
         renderMarkersPane();

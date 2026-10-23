@@ -24,6 +24,7 @@ the commit that renamed a heading would itself bump the count and make that head
 
 ## Unreleased
 
+- While a clip is playing (or paused), the **←** and **→** keys now jump back and forward 10 seconds, staying within the selected range. The space bar then plays from the new spot. This works on the Transcription tab and in the slice editor.
 - A **Play through** pull-down in the title bar, next to the light/dark switch, chooses which output device Vocal Slice plays to — headphones, an interface, a virtual device — without changing your system output. It applies to the Transcription tab, the slice editor and the clips on the Slices tab, and switches mid-play. If the chosen device is unplugged, playback falls back to the system default and comes back to it when it reappears.
 - Fixed transcription getting stuck forever when Whisper falls into a loop on a stretch it can't make out — music, silence, background noise — repeating the same few words ("Cassie, the Cassie, the Cassie…") while the status sat on "Lining up the words". The transcription library had started re-reading such a stretch from the same point over and over; each stretch is now read once and the run moves on.
 - When Whisper does repeat itself like that, the transcript no longer fills with the repeated phrase. You get the phrase once, then an **[unclear]** marker covering the rest of that stretch, so you can see where it happened and listen for yourself. The Log tab says what was collapsed and where.
